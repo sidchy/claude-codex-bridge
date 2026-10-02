@@ -460,6 +460,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     raw_tail = deque(maxlen=20)
     final = ""
     execution_failed = False
+    turn_completed = False
 
     try:
         with open(_job_path(jid, "events.jsonl"), "a", buffering=1) as evf:
@@ -471,7 +472,9 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                 p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, cwd=cdir, bufsize=0,
                                      start_new_session=True)
-                st.update(child_pid=p.pid, pgid=p.pid)
+                snapshot = process_snapshot()
+                identity = snapshot[p.pid][3] if snapshot is not None and p.pid in snapshot else None
+                st.update(child_pid=p.pid, pgid=p.pid, child_identity=identity)
             for line in child_lines(p, prompt, cfg["timeout"], jid):
                 try:
                     ev = json.loads(line)
@@ -495,9 +498,11 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                         cmds += 1
                         failed += it.get("exit_code") not in (0, None)
                 elif t in ("error", "turn.failed"):
-                    execution_failed = True
+                    if t == "turn.failed":
+                        execution_failed = True
                     errors.append(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False))
                 elif t == "turn.completed":
+                    turn_completed = True
                     res["usage"] = ev.get("usage")
                 if live:
                     for ln in render_event(ev):
@@ -512,7 +517,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     finally:
         if p:
             try:
-                if timed_out or execution_failed or p.poll() is None:
+                if timed_out or execution_failed or not turn_completed or not (final or (msgs[-1] if msgs else "")) or p.poll() != 0:
                     terminate_group(p.pid, process=p, jid=jid)
             except (OSError, subprocess.SubprocessError) as exc:
                 cleanup_errors.append(str(exc))
@@ -525,8 +530,14 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                     pipe.close()
         Path(out).unlink(missing_ok=True)
     res["text"] = final or (msgs[-1] if msgs else "")
-    res["ok"] = bool(p and p.returncode == 0 and res["text"] and not timed_out and not execution_failed and not cleanup_errors)
+    res["ok"] = bool(p and p.returncode == 0 and res["text"] and turn_completed and not timed_out and not execution_failed and not cleanup_errors)
+    res["warnings"] = errors if not execution_failed else []
+    res["cleanup_pending"] = bool(cleanup_errors)
+    res["cleanup_error"] = "; ".join(cleanup_errors)
+    res["timed_out"] = bool(timed_out)
     if not res["ok"]:
+        if not turn_completed:
+            errors.append("no turn.completed event received")
         res["error"] = (f"codex timed out after {cfg['timeout']}s" if timed_out
                         else "\n".join(errors) or f"exit {p.returncode if p else 'not started'}")
         if raw_tail:
@@ -750,7 +761,7 @@ def _jread(jid):
         return None
 
 
-ACTIVE = {"running", "cancelling"}
+ACTIVE = {"running", "cancelling", "cleanup_pending"}
 CANCEL_GRACE = 1.0
 
 
@@ -762,14 +773,15 @@ PIPE_DRAIN_TIMEOUT = 1.0
 def process_snapshot():
     """None means enumeration unavailable, not an empty process table."""
     try:
-        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="],
-                                capture_output=True, text=True, timeout=PS_TIMEOUT)
+        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
+                                capture_output=True, text=True, timeout=PS_TIMEOUT,
+                                env={**os.environ, "LC_ALL": "C"})
         if result.returncode:
             return None
         rows = {}
         for line in result.stdout.splitlines():
-            pid, parent, group, status = line.split()
-            rows[int(pid)] = (int(parent), int(group), status)
+            pid, parent, group, status, started = line.split(None, 4)
+            rows[int(pid)] = (int(parent), int(group), status, " ".join(started.split()))
         return rows or None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -800,47 +812,73 @@ def group_alive(pgid, snapshot=None):
         snapshot = process_snapshot()
     if snapshot is None:
         return True
-    return any(group == pgid and not status.startswith("Z") for _, group, status in snapshot.values())
+    return any(group == pgid and not status.startswith("Z") for _, group, status, _ in snapshot.values())
 
 
-def collect_descendants(root, pids, groups, snapshot):
-    """Close over the entire tree, including tools that created new sessions."""
-    pids.add(root)
-    groups.add(root)
-    if snapshot is not None:
-        while True:
-            previous = len(pids)
-            for pid, (parent, group, status) in snapshot.items():
-                if pid in pids or parent in pids or group in groups:
-                    pids.add(pid)
-                    if group > 1 and group != os.getpgrp():
-                        groups.add(group)
-            if len(pids) == previous:
-                break
-    pids.discard(os.getpid())
-    groups.discard(os.getpgrp())
+def recorded_processes(st):
+    # Legacy PID-only lists are intentionally not trusted for signalling.
+    return {int(pid): dict(record) for pid, record in st.get("tracked_processes", {}).items()}
 
 
-def remember_processes(jid, pids, groups, scan_failed=False):
+def verify_processes(tracked, snapshot):
+    if snapshot is None:
+        return dict(tracked)  # retain uncertainty for a later scan, never signal these blindly
+    return {pid: {"identity": record["identity"], "pgid": snapshot[pid][1]}
+            for pid, record in tracked.items()
+            if pid in snapshot and snapshot[pid][3] == record["identity"]
+            and not snapshot[pid][2].startswith("Z")}
+
+
+def collect_descendants(root, tracked, snapshot, root_identity=None, owned_child=False):
+    """Only a verified process identity can establish ownership of descendants."""
+    tracked = verify_processes(tracked, snapshot)
+    if snapshot is None:
+        return tracked
+    row = snapshot.get(root)
+    if row and not row[2].startswith("Z") and (row[3] == root_identity or (not root_identity and owned_child)):
+        tracked[root] = {"identity": row[3], "pgid": row[1]}
+    while True:
+        previous = len(tracked)
+        groups = {r["pgid"] for r in tracked.values() if r["pgid"] > 1 and r["pgid"] != os.getpgrp()}
+        for pid, (parent, group, status, identity) in snapshot.items():
+            if pid != os.getpid() and pid != root and (parent in tracked or group in groups) and not status.startswith("Z"):
+                tracked[pid] = {"identity": identity, "pgid": group}
+        if len(tracked) == previous:
+            break
+    tracked.pop(os.getpid(), None)
+    return tracked
+
+
+def remember_processes(jid, tracked, snapshot):
     if jid is None:
         return
     with job_state(jid) as st:
-        st["tracked_pids"] = sorted(set(st.get("tracked_pids", [])) | pids)
-        st["tracked_pgids"] = sorted(set(st.get("tracked_pgids", [])) | groups)
-        if scan_failed:
-            st["process_scan_warning"] = "ps unavailable; cleanup falls back to recorded processes/groups"
+        merged = recorded_processes(st)
+        merged.update(tracked)
+        merged = verify_processes(merged, snapshot)
+        st["tracked_processes"] = {str(pid): record for pid, record in merged.items()}
+        st["tracked_pids"] = sorted(merged)
+        st["tracked_pgids"] = sorted({record["pgid"] for record in merged.values()})
+        root = st.get("child_pid")
+        if not st.get("child_identity") and root in tracked:
+            st["child_identity"] = tracked[root]["identity"]
+        if snapshot is not None and root in snapshot and st.get("child_identity"):
+            if snapshot[root][3] != st["child_identity"]:
+                st["child_identity_mismatch"] = True
+        if snapshot is None:
+            st["process_scan_warning"] = "ps unavailable; signalling falls back to the original child group only"
 
 
-def targets_alive(pids, groups, snapshot):
+def targets_alive(tracked, snapshot, fallback_group=None):
     if snapshot is not None:
-        return any((pid in pids or group in groups) and not status.startswith("Z")
-                   for pid, (_, group, status) in snapshot.items())
-    for pid in pids:
-        if _alive(pid):
-            return True
-    for group in groups:
+        return bool(verify_processes(tracked, snapshot))
+    # An unverified PID may have been reused, so this is only an uncertainty
+    # check. It must not authorize signalling or a terminal transition.
+    if any(_alive(pid) for pid in tracked):
+        return True
+    if fallback_group:
         try:
-            os.killpg(group, 0)
+            os.killpg(fallback_group, 0)
             return True
         except ProcessLookupError:
             pass
@@ -850,32 +888,56 @@ def targets_alive(pids, groups, snapshot):
 
 
 def terminate_group(pgid, process=None, jid=None):
-    """Terminate the recorded group AND all discovered descendants, with bounds."""
+    """Bounded tree cleanup; verify identities before discovery and signalling."""
     if not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
         raise OSError(f"unsafe or missing process group: {pgid}")
-    st = _jread(jid) or {} if jid else {}
-    pids, groups = set(st.get("tracked_pids", [])), set(st.get("tracked_pgids", []))
+    st = (_jread(jid) or {}) if jid else {}
+    tracked = recorded_processes(st)
+    root_identity = st.get("child_identity")
+    root_reused = st.get("child_identity_mismatch", False)
     failures = []
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        snapshot = process_snapshot()
-        collect_descendants(pgid, pids, groups, snapshot)
-        # Persist BEFORE signalling, so an interrupted cancel can be refreshed safely.
-        remember_processes(jid, pids, groups, snapshot is None)
         deadline = time.monotonic() + CANCEL_GRACE
         signalled_pids, signalled_groups = set(), set()
         while True:
-            # Signal descendants first, the root last. Newly found children are
-            # included even if a parent forks during the grace period.
-            for group in sorted(groups - signalled_groups, key=lambda g: g == pgid):
+            owned_child = process is not None and process.poll() is None
+            snapshot = process_snapshot()
+            if jid and not root_identity:
+                root_identity = (_jread(jid) or {}).get("child_identity")
+            if snapshot is not None and pgid in snapshot and root_identity:
+                root_reused = root_reused or snapshot[pgid][3] != root_identity
+            tracked = collect_descendants(pgid, tracked, snapshot, root_identity, owned_child and not root_reused)
+            if not root_identity and pgid in tracked:
+                root_identity = tracked[pgid]["identity"]
+            remember_processes(jid, tracked, snapshot)
+            # Re-check immediately before sending signals. Group ownership needs
+            # a currently verified member; a recycled numeric PGID is not enough.
+            current = process_snapshot()
+            tracked = verify_processes(tracked, current)
+            if current is not None and pgid in current and root_identity:
+                root_reused = root_reused or current[pgid][3] != root_identity
+            remember_processes(jid, tracked, current)
+            fallback = pgid if not root_reused else None
+            groups = ({record["pgid"] for record in tracked.values()} if current is not None
+                      else ({fallback} if fallback else set()))
+            groups.discard(os.getpgrp())
+            pids = set(tracked) if current is not None else set()
+            for group in sorted(groups, key=lambda g: g == pgid):
+                # Anchor the signal to member identities, not just the group ID.
+                anchor = tuple(sorted((pid, r["identity"]) for pid, r in tracked.items() if r["pgid"] == group))
+                token = (group, anchor)
+                if group <= 1 or token in signalled_groups:
+                    continue
                 try:
                     os.killpg(group, sig)
                 except ProcessLookupError:
                     pass
                 except OSError as exc:
                     failures.append(str(exc))
-                signalled_groups.add(group)
-            for pid in sorted(pids - signalled_pids, key=lambda pid: pid == pgid):
-                if pid <= 1 or pid == os.getpid():
+                signalled_groups.add(token)
+            for pid in sorted(pids, key=lambda pid: pid == pgid):
+                token = (pid, tracked[pid]["identity"])
+                if pid <= 1 or pid == os.getpid() or token in signalled_pids:
                     continue
                 try:
                     os.kill(pid, sig)
@@ -883,16 +945,18 @@ def terminate_group(pgid, process=None, jid=None):
                     pass
                 except OSError as exc:
                     failures.append(str(exc))
-                signalled_pids.add(pid)
+                signalled_pids.add(token)
             if process:
                 process.poll()
             snapshot = process_snapshot()
-            if not targets_alive(pids, groups, snapshot):
+            tracked = verify_processes(tracked, snapshot)
+            remember_processes(jid, tracked, snapshot)
+            unknown_root = (snapshot is not None and pgid in snapshot and not root_identity
+                            and not snapshot[pgid][2].startswith("Z") and not owned_child)
+            if not unknown_root and not targets_alive(tracked, snapshot, fallback):
                 return
             if time.monotonic() >= deadline:
                 break
-            collect_descendants(pgid, pids, groups, snapshot)
-            remember_processes(jid, pids, groups, snapshot is None)
             time.sleep(0.05)
     raise OSError("process tree still alive or exit unconfirmed after SIGKILL" +
                   (": " + "; ".join(failures[-3:]) if failures else ""))
@@ -905,7 +969,8 @@ def child_lines(process, prompt, timeout, jid):
     next_scan = 0
     pending = memoryview((prompt or "").encode())
     buffer = b""
-    pids, groups = {process.pid}, {process.pid}
+    tracked = {}
+    root_identity = (_jread(jid) or {}).get("child_identity")
     with selectors.DefaultSelector() as selector:
         for pipe in (process.stdin, process.stdout):
             os.set_blocking(pipe.fileno(), False)
@@ -920,8 +985,10 @@ def child_lines(process, prompt, timeout, jid):
                 raise subprocess.TimeoutExpired("codex", timeout)
             if now >= next_scan:
                 snapshot = process_snapshot()
-                collect_descendants(process.pid, pids, groups, snapshot)
-                remember_processes(jid, pids, groups, snapshot is None)
+                tracked = collect_descendants(process.pid, tracked, snapshot, root_identity, process.poll() is None)
+                if not root_identity and process.pid in tracked:
+                    root_identity = tracked[process.pid]["identity"]
+                remember_processes(jid, tracked, snapshot)
                 next_scan = time.monotonic() + 0.5
             if (_jread(jid) or {}).get("status") in ("cancelling", "cancelled"):
                 if cancel_deadline is None:
@@ -973,12 +1040,22 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
 
 def finish_run(r):
     with job_state(r["jid"]) as st:
-        if st.get("status") in ("cancelling", "cancelled"):
-            st["worker_finished"] = True
+        st["worker_finished"] = True
+        if st.get("status") == "cancelled":
+            return
+        if r.get("cleanup_pending"):
+            st.update(status="cleanup_pending",
+                      cleanup_target="cancelled" if st.get("status") == "cancelling" else st.get("cleanup_target", "failed"),
+                      cleanup_error=r["cleanup_error"], error=r["error"],
+                      timed_out=r.get("timed_out", False), usage=r["usage"])
+            st.pop("finished", None)
+            Path(_job_path(r["jid"], "result.txt")).write_text("CLEANUP PENDING: " + r["error"])
+            return
+        if st.get("status") in ("cancelling", "cleanup_pending"):
             return
         Path(_job_path(r["jid"], "result.txt")).write_text(r["text"] if r["ok"] else "FAILED: " + r["error"])
         st.update(status="done" if r["ok"] else "failed", usage=r["usage"],
-                  error=r["error"], finished=time.time())
+                  error=r["error"], timed_out=r.get("timed_out", False), finished=time.time())
 
 
 def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None, name=None, jid=None):
@@ -1064,16 +1141,26 @@ def _refresh(jid):
             snapshot = process_snapshot()
             worker_alive = (st.get("pid") in snapshot and not snapshot[st["pid"]][2].startswith("Z")) if snapshot is not None else _alive(st.get("pid"))
             worker_alive = worker_alive and not st.get("worker_finished")
-            pids = set(st.get("tracked_pids", []))
-            groups = set(st.get("tracked_pgids", []))
-            if st.get("child_pid"):
-                pids.add(st["child_pid"])
-            if st.get("pgid"):
-                groups.add(st["pgid"])
-            execution_alive = targets_alive(pids, groups, snapshot)
+            tracked = recorded_processes(st)
+            root, identity = st.get("child_pid"), st.get("child_identity")
+            if root and identity and not st.get("child_identity_mismatch"):
+                tracked.setdefault(root, {"identity": identity, "pgid": st.get("pgid", root)})
+            tracked = verify_processes(tracked, snapshot)
+            st["tracked_processes"] = {str(pid): record for pid, record in tracked.items()}
+            st["tracked_pids"] = sorted(tracked)
+            st["tracked_pgids"] = sorted({record["pgid"] for record in tracked.values()})
+            if snapshot is not None and root in snapshot and identity and snapshot[root][3] != identity:
+                st["child_identity_mismatch"] = True
+            fallback = None if st.get("child_identity_mismatch") else st.get("pgid")
+            execution_alive = targets_alive(tracked, snapshot, fallback)
+            if root and not identity and _alive(root):
+                execution_alive = True  # legacy/initially unobservable child: cannot confirm exit
             if not worker_alive and not execution_alive:
-                if st["status"] == "cancelling":
-                    st.update(status="cancelled", finished=time.time())
+                if st["status"] in ("cancelling", "cleanup_pending"):
+                    target = "cancelled" if st["status"] == "cancelling" else st.get("cleanup_target", "failed")
+                    st.update(status=target, finished=time.time())
+                    if target == "failed":
+                        Path(_job_path(jid, "result.txt")).write_text("FAILED: " + st.get("error", "cleanup completed"))
                 else:
                     st.update(status="failed", error="worker process died")
         return dict(st)
@@ -1125,6 +1212,7 @@ def cmd_cancel(a):
             print(f"job {jid} is {st.get('status')}")
             return
         st["status"] = "cancelling"
+        st["cleanup_target"] = "cancelled"
         st.setdefault("cancel_reason", "cancel requested")
         pgid = st.get("pgid")
         legacy = "pgid" not in st
@@ -1134,8 +1222,10 @@ def cmd_cancel(a):
         if pgid is not None:
             terminate_group(pgid, jid=jid)
     except OSError as exc:
-        _jwrite(jid, error=f"cancellation failed: {exc}")
-        sys.exit(f"cancellation failed for {jid}: {exc}; status remains cancelling")
+        with job_state(jid) as st:
+            st.update(status="cleanup_pending", cleanup_target="cancelled", cleanup_error=str(exc),
+                      error=(st.get("error", "") + f"\ncancellation failed: {exc}").strip())
+        sys.exit(f"cancellation failed for {jid}: {exc}; status remains cleanup_pending")
     with job_state(jid) as st:
         st.update(status="cancelled", finished=time.time())
     print(f"cancelled {jid}")

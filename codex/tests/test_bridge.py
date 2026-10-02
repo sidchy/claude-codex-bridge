@@ -31,7 +31,9 @@ class BridgeTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.env = {**os.environ, "CODEX_BRIDGE_HOME": str(self.home), "CODEX_HOME": str(self.root / "native")}
-        native_patch = mock.patch.dict(os.environ, {"CODEX_HOME": self.env["CODEX_HOME"], "CODEX_BRIDGE_HOME": str(self.home)})
+        # Directly executable bridge/fake scripts must use this suite's interpreter too.
+        self.env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ["PATH"]
+        native_patch = mock.patch.dict(os.environ, {"CODEX_HOME": self.env["CODEX_HOME"], "CODEX_BRIDGE_HOME": str(self.home), "PATH": self.env["PATH"]})
         native_patch.start()
         self.addCleanup(native_patch.stop)
         self.catalog = [{"slug": model, "visibility": "list", "supported_reasoning_levels": [{"effort": effort} for effort in ("low", "medium", "high")]} for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna")]
@@ -45,9 +47,12 @@ class BridgeTests(unittest.TestCase):
     def args(self, **kw):
         return argparse.Namespace(cd=str(self.cwd), prompt="hello", background=False, add_dir=None, **kw)
 
-    def fake(self, code):
+    def fake(self, code, complete=True):
         binary = self.root / "fake codex"
         binary.write_text("#!/usr/bin/env python3\nimport sys,json\nif 'debug' in sys.argv and 'models' in sys.argv:\n print(" + repr(json.dumps({"models": self.catalog})) + "); sys.exit(0)\n" + code)
+        if complete:
+            with binary.open("a") as f:
+                f.write("\nprint(json.dumps({'type':'turn.completed'}))\n")
         binary.chmod(0o755)
         b.save({**b.load(), "codex_bin": str(binary)})
         return binary
@@ -124,9 +129,9 @@ class BridgeTests(unittest.TestCase):
         b._jwrite(jid, pgid=999999)
         with mock.patch.object(b, "terminate_group", side_effect=PermissionError("denied")), self.assertRaisesRegex(SystemExit, "cancellation failed"):
             b.cmd_cancel(argparse.Namespace(job=jid))
-        self.assertEqual(b._jread(jid)["status"], "cancelling")
+        self.assertEqual(b._jread(jid)["status"], "cleanup_pending")
         b.finish_run({"jid": jid, "ok": True, "text": "ok", "error": "", "usage": None})
-        self.assertEqual(b._jread(jid)["status"], "cancelling")
+        self.assertEqual(b._jread(jid)["status"], "cleanup_pending")
 
     def test_spawn_failure_is_recorded(self):
         self.fake("pass\n")
@@ -436,7 +441,7 @@ class BridgeTests(unittest.TestCase):
             del st["pgid"]
         with self.assertRaisesRegex(SystemExit, "no execution process group"):
             b.cmd_cancel(argparse.Namespace(job=jid))
-        self.assertEqual(b._jread(jid)["status"], "cancelling")
+        self.assertEqual(b._jread(jid)["status"], "cleanup_pending")
 
     def test_r1_resume_passes_recorded_sandbox(self):
         capture = self.root / "resume-argv.json"
@@ -464,7 +469,7 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("timed out", r["error"])
         descendant = int(self.ready.read_text())
         self.assert_dead(descendant)
-        self.assertIn(descendant, b._jread(r["jid"])["tracked_pids"])
+        self.assertNotIn(descendant, b._jread(r["jid"])["tracked_pids"])
         self.ready.unlink()
         jid = b.new_run("task", self.cfg(), "hi", str(self.cwd))
         with ThreadPoolExecutor(1) as pool:
@@ -539,9 +544,10 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(session, "old-thread")
         self.assertTrue(resumed)
         # A still-running descendant prevents premature convergence.
-        b._jwrite(new, status="cancelling", worker_finished=True, tracked_pids=[os.getpid()])
+        row = b.process_snapshot()[os.getpid()]
+        b._jwrite(new, status="cancelling", worker_finished=True, tracked_processes={str(os.getpid()): {"identity": row[3], "pgid": row[1]}})
         self.assertEqual(b._refresh(new)["status"], "cancelling")
-        b._jwrite(new, tracked_pids=[])
+        b._jwrite(new, tracked_processes={})
         self.assertEqual(b._refresh(new)["status"], "cancelled")
 
     def test_r5_custom_models_and_profile_catalog_cache(self):
@@ -629,6 +635,141 @@ class BridgeTests(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertNotIn(latest["status"], b.ACTIVE)
+
+    def test_f1_recoverable_error_and_terminal_failures(self):
+        cases = [
+            ([{"type": "error", "message": "Reconnecting..."}, {"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}, {"type": "turn.completed"}], 0, True),
+            ([{"type": "turn.failed", "error": "terminal"}, {"type": "item.completed", "item": {"type": "agent_message", "text": "partial"}}, {"type": "turn.completed"}], 0, False),
+            ([{"type": "error", "message": "disconnected"}], 1, False),
+            ([{"type": "item.completed", "item": {"type": "agent_message", "text": "incomplete"}}], 0, False),
+        ]
+        for events, code, expected in cases:
+            with self.subTest(events=events):
+                self.fake("events=" + repr(events) + "\nfor event in events: print(json.dumps(event),flush=True)\nsys.exit(" + str(code) + ")\n", complete=False)
+                with mock.patch.object(b, "terminate_group", wraps=b.terminate_group) as terminate, contextlib.redirect_stderr(io.StringIO()) as timeline:
+                    r = b.exec_codex(self.cfg(), "hi", str(self.cwd), live=True)
+                self.assertEqual(r["ok"], expected, r["error"])
+                if expected:
+                    terminate.assert_not_called()
+                    self.assertIn("Reconnecting", timeline.getvalue())
+                    self.assertTrue(r["warnings"])
+                else:
+                    self.assertTrue(r["error"])
+
+    def test_f2_cleanup_pending_blocks_reuse_and_converges(self):
+        import signal
+        from concurrent.futures import ThreadPoolExecutor
+        real_kill, real_killpg = os.kill, os.killpg
+        for retry_cancel in (False, True):
+            with self.subTest(retry_cancel=retry_cancel):
+                self.hanging_fake(detached=True)
+                self.ready.unlink(missing_ok=True)
+                jid = b.new_run("task", self.cfg(), "hi", str(self.cwd), name="pending")
+                def blocked_pid():
+                    return int(self.ready.read_text()) if self.ready.exists() else None
+                def kill(pid, sig):
+                    if pid == blocked_pid() and sig != 0:
+                        raise PermissionError("injected descendant kill failure")
+                    return real_kill(pid, sig)
+                def killpg(pgid, sig):
+                    if pgid == blocked_pid() and sig != 0:
+                        raise PermissionError("injected descendant group kill failure")
+                    return real_killpg(pgid, sig)
+                try:
+                    with mock.patch.object(b.os, "kill", side_effect=kill), mock.patch.object(b.os, "killpg", side_effect=killpg):
+                        r = b.exec_codex(self.cfg(timeout=1), "hi", str(self.cwd), jid=jid)
+                    b.finish_run(r)
+                    self.assertTrue(r["cleanup_pending"])
+                    state = b._refresh(jid)
+                    self.assertEqual(state["status"], "cleanup_pending")
+                    self.assertTrue(state["timed_out"])
+                    self.assertIn("timed out", state["error"])
+                    self.assertIn("kill failure", state["cleanup_error"])
+                    with self.assertRaisesRegex(SystemExit, "already has active job"):
+                        b.prepare_run(self.args(name="pending"), False)
+                    if retry_cancel:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            b.cmd_cancel(argparse.Namespace(job=jid))
+                    else:
+                        b.terminate_group(state["pgid"], jid=jid)
+                    self.assertEqual(b._refresh(jid)["status"], "cancelled" if retry_cancel else "failed")
+                    self.assert_dead(blocked_pid())
+                finally:
+                    state = b._jread(jid)
+                    if state.get("pgid"):
+                        b.terminate_group(state["pgid"], jid=jid)
+
+    def test_f3_reused_pid_is_not_adopted_or_signalled(self):
+        import signal
+        import time
+        unrelated = subprocess.Popen([sys.executable, "-c", "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print(p.pid,flush=True); time.sleep(60)"], start_new_session=True, stdout=subprocess.PIPE, text=True)
+        root = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        child = int(unrelated.stdout.readline())
+        real_kill, real_killpg = os.kill, os.killpg
+        def kill(pid, sig):
+            if sig and pid in (unrelated.pid, child):
+                self.fail("signalled an unrelated reused PID")
+            return real_kill(pid, sig)
+        def killpg(pgid, sig):
+            if sig and pgid == unrelated.pid:
+                self.fail("signalled an unrelated reused process group")
+            return real_killpg(pgid, sig)
+        try:
+            snapshot = b.process_snapshot()
+            self.assertIn(root.pid, snapshot)
+            identity = snapshot[root.pid][3]
+            stale = {unrelated.pid: {"identity": "previous process start time", "pgid": unrelated.pid}}
+            tracked = b.collect_descendants(root.pid, stale, snapshot, identity)
+            self.assertNotIn(unrelated.pid, tracked)
+            self.assertNotIn(child, tracked)
+            jid = b.new_run("task", self.cfg(), "hi", str(self.cwd))
+            b._jwrite(jid, child_pid=root.pid, pgid=root.pid, child_identity=identity,
+                      tracked_pids=[unrelated.pid], tracked_pgids=[unrelated.pid],
+                      tracked_processes={str(pid): value for pid, value in stale.items()})
+            with mock.patch.object(b.os, "kill", side_effect=kill), mock.patch.object(b.os, "killpg", side_effect=killpg):
+                b.terminate_group(root.pid, process=root, jid=jid)
+            root.wait(timeout=2)
+            st = b._jread(jid)
+            self.assertNotIn(str(unrelated.pid), st["tracked_processes"])
+            self.assertNotIn(str(child), st["tracked_processes"])
+            self.assertIsNone(unrelated.poll())
+            # The original CLI PID can itself be recycled; it gets no fallback
+            # group signal once a mismatch is observed.
+            b._jwrite(jid, child_pid=unrelated.pid, pgid=unrelated.pid,
+                      child_identity="previous CLI start time", tracked_processes={})
+            with mock.patch.object(b.os, "kill", side_effect=kill), mock.patch.object(b.os, "killpg", side_effect=killpg):
+                b.terminate_group(unrelated.pid, jid=jid)
+                with mock.patch.object(b, "process_snapshot", return_value=None):
+                    b.terminate_group(unrelated.pid, jid=jid)
+            self.assertTrue(b._jread(jid)["child_identity_mismatch"])
+            self.assertIsNone(unrelated.poll())
+        finally:
+            for proc in (root, unrelated):
+                try:
+                    real_killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=2)
+            unrelated.stdout.close()
+
+    def test_f3_identity_checked_again_before_signalling(self):
+        import signal
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            current = b.process_snapshot()
+            older = dict(current)
+            row = current[unrelated.pid]
+            older[unrelated.pid] = (row[0], row[1], row[2], "old start")
+            jid = b.new_run("task", self.cfg(), "hi", str(self.cwd))
+            b._jwrite(jid, child_pid=unrelated.pid, pgid=unrelated.pid, child_identity="old start")
+            with mock.patch.object(b, "process_snapshot", side_effect=[older, current, current]), mock.patch.object(b.os, "kill") as kill, mock.patch.object(b.os, "killpg") as killpg:
+                b.terminate_group(unrelated.pid, jid=jid)
+            kill.assert_not_called()
+            killpg.assert_not_called()
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.kill()
+            unrelated.wait(timeout=2)
 
 
 if __name__ == "__main__":
