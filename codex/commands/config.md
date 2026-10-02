@@ -1,5 +1,5 @@
 ---
-description: Show or change Codex bridge settings (model, reasoning effort, sandbox, timeout)
+description: 可选：改默认模型/强度/权限（一般不用管，默认 gpt-6.1-sol medium 全权限）
 argument-hint: [show | set model=.. effort=.. sandbox=.. | reset | models]
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*)
 disable-model-invocation: true

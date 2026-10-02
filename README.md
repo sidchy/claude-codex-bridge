@@ -9,13 +9,10 @@ Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `me
 ```
 (or one-off: `claude --plugin-dir /absolute/path/to/claude-codex-plugin/codex`)
 
-## Use
-- `/codex:run <task>` — delegate a task
-- `/codex:config set model=gpt-5.6-terra effort=high` · `/codex:config models` · `/codex:config reset`
-- `/codex:team <goal>` — split into parallel Codex sub-tasks with matched roles (explorer/worker/debugger/reviewer/architect)
-- `/codex:review [--adversarial] [--base REF]` · `/codex:status` (settings + jobs) · `/codex:result` · `/codex:cancel`
-- `--background` on run/review returns a job id; check with status/result/cancel
-- Nothing triggers automatically: Claude only uses Codex when you type a /codex command. `/codex:run <anything>` picks the mode for you (see docs/routing.md).
+## Use (plug and play)
+- `/codex:run <说人话描述需求>` — that's it. Claude decides review vs debug vs build vs explore vs design, background vs foreground, parallel vs serial, model/effort; empty request = review current changes.
+- `/codex:review [--adversarial]` — shortcut for review. `/codex:status [result|cancel]` — jobs. `/codex:config` — optional defaults (gpt-6.1-sol, medium, full permission).
+- Nothing triggers automatically; only when you type a /codex command.
 
 Requires `codex` on PATH and `python3`. Settings: `~/.claude/codex-bridge/settings.json`.
 
