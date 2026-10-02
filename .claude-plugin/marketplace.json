@@ -1,0 +1,7 @@
+{
+  "name": "codex-bridge",
+  "owner": { "name": "local" },
+  "plugins": [
+    { "name": "codex", "source": "./codex", "description": "Claude plans, local Codex CLI executes." }
+  ]
+}
