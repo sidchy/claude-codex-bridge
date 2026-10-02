@@ -30,19 +30,19 @@ DEFAULTS = {
     "roles": {},  # user overrides/additions, merged over ROLES below
 }
 
-# Role presets: Claude picks the role that fits the job. Each sets sandbox/effort
-# (and optionally model) plus a preamble that frames Codex's behaviour.
+# Role presets: Claude picks the role that fits the job. Each sets sandbox plus a preamble
+# (effort/model follow the saved config unless a role or flag sets them explicitly) that frames Codex's behaviour.
 ROLES = {
-    "explorer": {"sandbox": "read-only", "effort": "low",
+    "explorer": {"sandbox": "read-only",
                  "preamble": "ROLE: explorer. Read-only reconnaissance. Do NOT modify files. Find facts fast and report file paths + line numbers + concise findings."},
-    "worker": {"sandbox": "danger-full-access", "effort": "medium",
-               "preamble": "ROLE: worker. Implement exactly the task described, nothing more. Touch only the files named or clearly required. Run the stated check/test command and report the real result."},
-    "debugger": {"sandbox": "danger-full-access", "effort": "high",
+    "worker": {"sandbox": "danger-full-access",
+                 "preamble": "ROLE: worker. Implement exactly the task described, nothing more. Touch only the files named or clearly required. Run the stated check/test command and report the real result."},
+    "debugger": {"sandbox": "danger-full-access",
                  "preamble": "ROLE: debugger. Reproduce first, find the root cause, then make the smallest fix. Report the cause, the fix and proof it works."},
-    "reviewer": {"sandbox": "read-only", "effort": "high",
+    "reviewer": {"sandbox": "read-only",
                  "preamble": "ROLE: reviewer. Read-only critical review. Report concrete defects ranked by severity with file:line and a failing scenario. Say so explicitly if you find nothing."},
-    "architect": {"sandbox": "read-only", "effort": "xhigh",
-                  "preamble": "ROLE: architect. Read-only design analysis. Give a recommendation with trade-offs and a step-by-step plan; do not implement."},
+    "architect": {"sandbox": "read-only",
+                 "preamble": "ROLE: architect. Read-only design analysis. Give a recommendation with trade-offs and a step-by-step plan; do not implement."},
 }
 EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
@@ -303,8 +303,28 @@ def print_footer(r):
           f"\n    transcript: {me} log {r['jid']}\n    take over : {me} attach {r['jid']}")
 
 
+def latest_thread(cwd):
+    """Newest Codex session started via this bridge in `cwd` (tasks only, not reviews/parallel)."""
+    if not os.path.isdir(JOBS):
+        return None
+    for jid in sorted(os.listdir(JOBS), reverse=True):
+        st = _jread(jid) or {}
+        if st.get("cwd") == cwd and st.get("kind") in ("task", "resume") and st.get("thread"):
+            return st["thread"]
+    return None
+
+
 def run_codex(a, resume):
     cfg = resolve(a, load())
+    session = getattr(a, "session", None)
+    if getattr(a, "cont", False) or (resume and not session):
+        session = session or latest_thread(os.path.abspath(a.cd or os.getcwd()))
+        if session:
+            resume = True
+        elif resume:
+            sys.exit("no earlier Codex session from this bridge in this directory; start with `run`")
+        else:
+            print("[codex] --continue: no earlier session here, starting a new one", file=sys.stderr)
     prompt = a.prompt
     if prompt in (None, "-"):
         prompt = sys.stdin.read()
@@ -312,8 +332,8 @@ def run_codex(a, resume):
         sys.exit("empty prompt")
     print(header(cfg, getattr(a, "role", None)) + (" (session inherited)" if resume else ""), file=sys.stderr)
     if a.background:
-        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, getattr(a, "session", None))
-    r = exec_codex(cfg, prompt, a.cd, a.add_dir, getattr(a, "session", None), resume, live=True,
+        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, session)
+    r = exec_codex(cfg, prompt, a.cd, a.add_dir, session, resume, live=True,
                    kind="resume" if resume else "task")
     finish_run(r)
     if not r["ok"]:
@@ -587,7 +607,7 @@ def cmd_parallel(a):
 def cmd_roles(_):
     roles = {**ROLES, **load().get("roles", {})}
     for n, r in roles.items():
-        print(f"{n:<10} sandbox={r.get('sandbox','-'):<16} effort={r.get('effort','-'):<7} "
+        print(f"{n:<10} sandbox={r.get('sandbox','-'):<18} effort={r.get('effort','(follows config)'):<17} "
               f"model={r.get('model','(default)')}  {r.get('preamble','')[:70]}")
 
 
@@ -602,6 +622,7 @@ def main():
         r.add_argument("--cd"); r.add_argument("--add-dir", action="append")
         r.add_argument("--timeout", type=int); r.add_argument("--profile")
         r.add_argument("--background", action="store_true", help="return a job id immediately")
+        r.add_argument("--continue", dest="cont", action="store_true", help="continue this directory's latest Codex session (same context) if any")
         if name == "resume":
             r.add_argument("--session", help="session id; default: most recent")
     c = sub.add_parser("config")

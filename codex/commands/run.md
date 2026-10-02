@@ -7,16 +7,28 @@ disable-model-invocation: true
 
 User request: $ARGUMENTS
 
-This command is plug-and-play. The user gives plain language only. NEVER ask them to choose a role, model, effort, sandbox, foreground/background, or parallel/serial. Decide everything yourself and just do it; ask a question only if the goal itself is truly ambiguous (one short question max).
+Plug and play: plain language only. NEVER ask the user to pick role/model/effort/sandbox/foreground/parallel; decide and act (one short question max, only if the goal is truly ambiguous).
+Script: `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR`). Run it by its FULL path, directly: never prefix `python3`, never put it in a shell variable (zsh exit 127). Prompt on stdin: `BR run [flags] - <<'PROMPT' ... PROMPT`.
 
-0. Supervision requests are part of this command, not separate commands. If the request is about an existing/running Codex run, handle it directly (latest job unless the user names one): "在干嘛/进度/看看" → open a live `watch` in the terminal pane (or `log`); "回看/详细过程" → `log` (`--full` if asked); "停/取消" → `cancel` then report partial changes via `git status`; "我来接手/接管" → `attach` and give the printed `codex resume ...` line; "结果" → `wait` then `result`. Otherwise continue below.
-1. Read `${CLAUDE_PLUGIN_ROOT}/docs/routing.md` and choose the mode from the request:
-   - empty request → `review` of the current uncommitted changes (if there are none, say so and stop)
-   - review / check / second opinion → `review` (add `--adversarial` if the change is risky)
-   - stuck / bug → debugger · build / edit / refactor → worker · find / explain → explorer · design first → architect
-   - slow or open-ended → `--background` and keep going, then collect the result yourself; independent pieces → run them in parallel
-   - "continue / keep going" → `resume`
-   Explicit flags in the request (`--model`, `--effort`, `--role`, `--sandbox`) are honored; otherwise use the defaults (`config`).
-2. Write a self-contained Codex prompt (it cannot see this chat) and run it via `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`, prompt on stdin.
-2b. Make it visible: follow "Visibility & control" in the routing guide: long/background runs get a live `watch` in the user's terminal pane, narrate checkpoints, and plan-first (architect → show plan → ask) for big or risky work.
-3. Verify the result yourself (diff / tests). 4. Reply briefly in the user's language: what Codex actually did (from the activity digest + a few bullets), what you verified, anything open, and how to take over (`attach`) or see the full transcript (`log`). No tool-flag talk.
+## 1. Pick the mode
+- Supervision of an existing run (latest unless named): "在干嘛/进度" → live view (see §3); "回看" → `BR log [id]` (`--full`); "停" → `BR cancel` then `git status`; "我来接手" → `BR attach` and give the printed `codex resume …` line; "结果" → `BR wait` then `BR result`.
+- empty / review / check / second opinion → `BR review [--base REF|--commit SHA] [focus]`; add `--adversarial` if risky or the user wants it tough. (No changes to review → say so, stop.)
+- stuck/bug → `--role debugger` · build/edit/refactor → `--role worker` · find/explain → `--role explorer` · design → `--role architect`.
+- Several independent pieces (disjoint files) → `BR parallel` (JSON list); dependent steps run in order (explorer → worker → reviewer).
+- Follow-up on the same work ("continue", "also…", fix its findings, same files/goal) → `BR run --continue "<short follow-up>"`: reuses the SAME Codex session of this directory, so Codex keeps its context and you only send the delta. Unrelated task, or reviews/second opinions that need fresh eyes → plain `run` (new session). Never start a new session for a follow-up.
+- Trivial one-liner, or needs this chat's context → do it yourself.
+
+## 2. Model / effort / sandbox: do NOT touch
+Use the saved defaults (`BR config`: gpt-6.1-sol, medium, full permission). Pass `--model/--effort/--sandbox` ONLY if the user named them in this request. Never raise effort on your own.
+
+## 3. Supervise (built in, not optional)
+- > ~30s or open-ended → `--background`, then open a live view for the user: `mcp__terminal__run_in_terminal` with `<absolute BR path> watch <id>` (ASCII only, one line, no `cwd`). No terminal tool → poll `BR log <id>` and relay.
+- Narrate in 1–2 plain lines at checkpoints; no raw logs.
+- Big/risky work (many files, delete/rename, migrations, hard to undo, or user wants to see the plan): run `--role architect` first, show the plan, ask approve/adjust (AskUserQuestion), then `worker`. "直接做" skips it.
+- Steering a running job: `BR cancel <id>`, then `BR run --continue "<correction>"`.
+
+## 4. Hand-off prompt (Codex can't see this chat; keep it tight)
+`Goal` (1 sentence) · `Context` (paths + facts you already know) · `Do`/`Don't touch` · `Done when` (command that must pass) · `Reply with` (files changed + check result, ≤10 lines).
+
+## 5. Verify and report
+Codex's "done" is a claim: check `git diff` and re-run the tests yourself. Reply briefly in the user's language: what Codex actually did (from its activity digest + a few bullets), what you verified, what's open, and how to take over (`attach`) / replay (`log`). Two Codex runs must never write the same files at once.
