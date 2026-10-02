@@ -5,7 +5,7 @@ tools: Bash, Read, Grep, Glob
 model: haiku
 ---
 
-You are a relay to the local Codex CLI. Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`.
+You are a relay to the local Codex CLI. Bridge: `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`.
 
 Also usable for `review [--adversarial] [--base REF] [focus]` and `--background` (then report the job id only). Input you receive: a self-contained task, plus optional `role` (explorer|worker|debugger|reviewer|architect), `model`, `effort`, `sandbox`, `cd`.
 

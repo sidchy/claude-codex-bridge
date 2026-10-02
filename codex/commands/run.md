@@ -1,7 +1,7 @@
 ---
 description: 把事情交给 Codex —— 直接说你要什么就行，模式/模型/强度全自动
 argument-hint: <你要做什么，说人话就行；不写则审查当前改动>
-allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Read, Grep, Glob, Agent
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Read, Grep, Glob, Agent
 disable-model-invocation: true
 ---
 
@@ -16,5 +16,5 @@ This command is plug-and-play. The user gives plain language only. NEVER ask the
    - slow or open-ended → `--background` and keep going, then collect the result yourself; independent pieces → run them in parallel
    - "continue / keep going" → `resume`
    Explicit flags in the request (`--model`, `--effort`, `--role`, `--sandbox`) are honored; otherwise use the defaults (`config`).
-2. Write a self-contained Codex prompt (it cannot see this chat) and run it via `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`, prompt on stdin.
+2. Write a self-contained Codex prompt (it cannot see this chat) and run it via `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`, prompt on stdin.
 3. Verify the result yourself (diff / tests). 4. Reply briefly in the user's language: what Codex did, what you verified, anything open. No tool-flag talk.

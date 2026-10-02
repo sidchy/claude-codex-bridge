@@ -2,7 +2,7 @@
 
 Claude = brain, Codex = hands & second pair of eyes. Only applies when the user invoked a /codex:* command.
 
-Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR` below). Defaults: `gpt-6.1-sol`, effort `medium`, **full permission, never asks**. Pick everything yourself; the user shouldn't have to say which mode.
+Bridge script: `../scripts/codex_bridge.py` relative to this docs folder; use its FULL absolute path (the command that sent you here shows it). It is executable: call it directly, e.g. `/abs/path/scripts/codex_bridge.py review --base main`. NEVER prefix `python3`, and NEVER store it in a shell variable (zsh won't word-split it and the call fails with exit 127). Below, `BR` is just shorthand for that absolute path. Defaults: `gpt-6.1-sol`, effort `medium`, **full permission, never asks**. Pick everything yourself; the user shouldn't have to say which mode.
 
 ## Route the request (decide silently)
 | Situation | Do |
