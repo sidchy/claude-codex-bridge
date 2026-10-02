@@ -2,11 +2,12 @@
 description: Split a goal into parallel Codex sub-tasks with matched roles, run them, then verify and merge
 argument-hint: <goal>
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Read, Grep, Glob, Agent
+disable-model-invocation: true
 ---
 
 Goal: $ARGUMENTS
 
-Run team mode per the `codex-delegate` skill:
+Run team mode per the routing guide `${CLAUDE_PLUGIN_ROOT}/docs/routing.md` (read it first):
 1. Recon yourself (or one `explorer` task) so you understand the scope.
 2. Decompose into independent sub-tasks with DISJOINT files. For each pick a role: explorer (read-only search) · worker (implement) · debugger (root-cause + fix) · reviewer (critique, read-only) · architect (design, read-only).
 3. Dispatch concurrently: write the task list as JSON and run `codex_bridge.py parallel - <<'JSON' ... JSON` (or several `codex-runner` agents / background Bash calls).

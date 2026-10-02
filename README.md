@@ -15,7 +15,7 @@ Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `me
 - `/codex:team <goal>` — split into parallel Codex sub-tasks with matched roles (explorer/worker/debugger/reviewer/architect)
 - `/codex:review [--adversarial] [--base REF]` · `/codex:status` (settings + jobs) · `/codex:result` · `/codex:cancel`
 - `--background` on run/review returns a job id; check with status/result/cancel
-- Or just say "让 codex 去做 …" — the `codex-delegate` skill triggers.
+- Nothing triggers automatically: Claude only uses Codex when you type a /codex command. `/codex:run <anything>` picks the mode for you (see docs/routing.md). Old note: "让 codex 去做 …" — use the /codex commands (nothing triggers automatically).
 
 Requires `codex` on PATH and `python3`. Settings: `~/.claude/codex-bridge/settings.json`.
 

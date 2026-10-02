@@ -2,6 +2,7 @@
 description: Show or change Codex bridge settings (model, reasoning effort, sandbox, timeout)
 argument-hint: [show | set model=.. effort=.. sandbox=.. | reset | models]
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*)
+disable-model-invocation: true
 ---
 
 Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` with the right subcommand for: $ARGUMENTS

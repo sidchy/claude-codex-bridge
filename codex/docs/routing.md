@@ -1,9 +1,6 @@
----
-name: codex-delegate
-description: The single entry point for using the local Codex CLI from Claude. Use it automatically (the user should never have to choose) when the user mentions codex / 让codex做, wants a code review or second opinion, when Claude is stuck on a bug, when work is bulk/mechanical/long-running/parallelizable, or before declaring a significant change finished. Claude plans and verifies; Codex executes, reviews, or investigates.
----
+# Codex routing guide (read by /codex:* commands)
 
-# Claude = brain, Codex = hands & second pair of eyes
+Claude = brain, Codex = hands & second pair of eyes. Only applies when the user invoked a /codex:* command.
 
 Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR` below). Defaults: `gpt-6.1-sol`, effort `medium`, **full permission, never asks**. Pick everything yourself; the user shouldn't have to say which mode.
 

@@ -1,6 +1,6 @@
 ---
 name: codex-runner
-description: Thin executor that hands one fully-specified task to the local Codex CLI (via the codex bridge), verifies the outcome, and returns a short report. Use to keep Codex output out of the main context, or to run several Codex tasks in parallel (one codex-runner per task, disjoint files).
+description: Relay for the /codex:* commands only. Do NOT use proactively or unprompted; use only when a /codex:* command or the user explicitly asks to run a task through Codex.
 tools: Bash, Read, Grep, Glob
 model: haiku
 ---
