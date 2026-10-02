@@ -16,7 +16,7 @@ Script: `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR`). Run it b
 - stuck/bug → `--role debugger` · build/edit/refactor → `--role worker` · find/explain → `--role explorer` · design → `--role architect`.
 - Several independent pieces (disjoint files) → `BR parallel` (JSON list); dependent steps run in order (explorer → worker → reviewer).
 - Follow-up on the same work ("continue", "also…", fix its findings, same files/goal) → `BR run --continue "<short follow-up>"`: reuses the SAME Codex session of this directory, so Codex keeps its context and you only send the delta. Unrelated task, or reviews/second opinions that need fresh eyes → plain `run` (new session). Never start a new session for a follow-up.
-- Trivial one-liner, or needs this chat's context → do it yourself.
+- **Very simple task → do it yourself, don't delegate.** Delegating costs more Claude tokens than it saves (command text, hand-off prompt, verification, report) plus ~15s+ Codex startup. Simple = most of: touches ≤2 files / ≤~15 changed lines, no test-fix loop, answerable in about a minute, a lookup or quick explanation, or depends on this chat's context. Do it directly, then say in one line that it was small enough to do yourself ("这个很小，我直接做了，没转给 Codex") and that they can force Codex by saying "强制用 codex". If the user already said to use Codex (or "强制 codex"), delegate regardless. Delegate when work is big (many files, long reading, test/fix loops), slow, parallelizable, or wants an independent second opinion.
 
 ## 2. Model / effort / sandbox: do NOT touch
 Use the saved defaults (`BR config`: gpt-6.1-sol, medium, full permission). Pass `--model/--effort/--sandbox` ONLY if the user named them in this request. Never raise effort on your own.
