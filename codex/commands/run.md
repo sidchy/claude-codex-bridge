@@ -18,8 +18,15 @@ Script: `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR`). Run it b
 - Follow-up on the same work ("continue", "also…", fix its findings, same files/goal) → `BR run --continue "<short follow-up>"`: reuses the SAME Codex session of this directory, so Codex keeps its context and you only send the delta. Unrelated task, or reviews/second opinions that need fresh eyes → plain `run` (new session). Never start a new session for a follow-up.
 - **Very simple task → do it yourself, don't delegate.** Delegating costs more Claude tokens than it saves (command text, hand-off prompt, verification, report) plus ~15s+ Codex startup. Simple = most of: touches ≤2 files / ≤~15 changed lines, no test-fix loop, answerable in about a minute, a lookup or quick explanation, or depends on this chat's context. Do it directly, then say in one line that it was small enough to do yourself ("这个很小，我直接做了，没转给 Codex") and that they can force Codex by saying "强制用 codex". If the user already said to use Codex (or "强制 codex"), delegate regardless. Delegate when work is big (many files, long reading, test/fix loops), slow, parallelizable, or wants an independent second opinion.
 
-## 2. Model / effort / sandbox: do NOT touch
-Use the saved defaults (`BR config`: gpt-6.1-sol, medium, full permission). Pass `--model/--effort/--sandbox` ONLY if the user named them in this request. Never raise effort on your own.
+## 2. Effort: default medium, escalate only when warranted
+Model and sandbox: use the saved defaults (`BR config`: gpt-6.1-sol, full permission); pass `--model/--sandbox` only if the user named them.
+Effort follows the saved default (medium) and about 80% of tasks should stay there. Pick per task with `--effort`:
+- **medium (default)**: clear spec, edits/refactors, recon, explanations, standard reviews, doc/data revisions that follow explicit instructions.
+- **high**: root cause unknown, or a medium attempt failed your verification; subtle logic across modules; data-integrity, migration or security-sensitive changes; `--adversarial` reviews; ambiguous or conflicting requirements.
+- **xhigh**: only after high failed, or genuinely intricate work (concurrency, algorithm design, major architecture decisions). Rare and slow: say so.
+- Never go below medium unless the user asks. If the user names an effort, that wins.
+Escalation ladder: if verification fails or Codex reports it is stuck → `BR run --continue --effort high "<what failed and why>"` (same session, keeps context) → if still failing, `--effort xhigh` → then stop and report to the user (max 2 escalations).
+Always tell the user which effort was used and why when it is not medium (e.g. "这次用了 high：第一次 medium 没通过测试").
 
 ## 3. Supervise (built in, not optional)
 - > ~30s or open-ended → `--background`, then open a live view for the user: `mcp__terminal__run_in_terminal` with `<absolute BR path> watch <id>` (ASCII only, one line, no `cwd`). No terminal tool → poll `BR log <id>` and relay.
