@@ -12,6 +12,7 @@ Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `me
 ## Use (plug and play)
 - `/codex:run <说人话描述需求>` — that's it. Claude decides review vs debug vs build vs explore vs design, background vs foreground, parallel vs serial, model/effort; empty request = review current changes.
 - `/codex:review [--adversarial]` — shortcut for review. `/codex:status [result|cancel]` — jobs. `/codex:config` — optional defaults (gpt-6.1-sol, medium, full permission).
+- 看得见、管得住：每次运行都完整记录；`/codex:status watch` 实时看 Codex 工作（桌面端在终端面板直播）、`log` 回看过程、`attach` 接管同一会话。
 - Nothing triggers automatically; only when you type a /codex command.
 
 Requires `codex` on PATH and `python3`. Settings: `~/.claude/codex-bridge/settings.json`.
