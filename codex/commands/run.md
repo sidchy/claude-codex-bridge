@@ -1,45 +1,49 @@
 ---
 description: Codex 的唯一入口：交活、审查、看进度、取消、接管，直接说人话，其余全自动
 argument-hint: <说人话：做什么 / 审查 / "它在干嘛" / "停" / "我来接手"；不写则审查当前改动>
-allowed-tools: mcp__terminal__run_in_terminal, Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Read, Grep, Glob, Agent
+allowed-tools: mcp__terminal__run_in_terminal, Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Bash(~/.claude/codex-bridge/bin/codex_bridge.py:*), Bash(git:*), Bash(python3 -m unittest:*), Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
 disable-model-invocation: true
 ---
 
-User request: $ARGUMENTS
+Handle $ARGUMENTS. Choose role/model/effort/sandbox and execution mode yourself; ask at most one question only if the goal is ambiguous. Invoke the executable directly, with its path quoted. Use this template, replacing the label, role, flags and brief as needed:
 
-Plug and play: plain language only. NEVER ask the user to pick role/model/effort/sandbox/foreground/parallel; decide and act (one short question max, only if the goal is truly ambiguous).
-Script: `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR`). Run it by its FULL path, directly: never prefix `python3`, never put it in a shell variable (zsh exit 127). Prompt on stdin: `BR run [flags] - <<'PROMPT' ... PROMPT`.
+```sh
+"${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run --name task-label --role worker --background - <<'PROMPT'
+Goal: describe the task.
+Context: paths and known facts.
+Do / Don't touch: scope and constraints.
+Done when: exact check command.
+Reply with: files changed and real check result, at most 10 lines.
+PROMPT
+```
 
-## 1. Pick the mode
-- Supervision of an existing run (latest unless named): "在干嘛/进度" → live view (see §3); "回看" → `BR log [id]` (`--full`); "停" → `BR cancel` then `git status`; "我来接手" → `BR attach` and give the printed `codex resume …` line; "结果" → `BR wait` then `BR result`.
-- empty / review / check / second opinion → `BR review [--base REF|--commit SHA] [focus]`; add `--adversarial` if risky or the user wants it tough. (No changes to review → say so, stop.)
-- stuck/bug → `--role debugger` · build/edit/refactor → `--role worker` · find/explain → `--role explorer` · design → `--role architect`.
-- Several independent pieces (disjoint files) → `BR parallel` (JSON list); dependent steps run in order (explorer → worker → reviewer).
-- Sessions = needs. One distinct need = its own named Codex session: `BR run --name <short-label> ...` (e.g. `cp3-impl`, `bulk-clean`). A follow-up on the SAME need reuses it by the same `--name` (Codex keeps context; model/effort are inherited and never switched). A new/unrelated need, or a fresh-eyes review/second opinion = a NEW session (never reuse the implementation session for review). Independent needs on disjoint files can run side by side as separate `--background` sessions.
-- Division of labor: bulk repetitive work = ONE lead session (sol medium) that fans out up to 20 `gpt-6-luna` sub-agents (the team policy already tells it how); hard reasoning = astra session; ordinary work = sol; review = astra high. Don't make Claude split what Codex's lead can split itself; do split across sessions when needs differ.
-- **Very simple task → do it yourself, don't delegate.** Delegating costs more Claude tokens than it saves (command text, hand-off prompt, verification, report) plus ~15s+ Codex startup. Simple = most of: touches ≤2 files / ≤~15 changed lines, no test-fix loop, answerable in about a minute, a lookup or quick explanation, or depends on this chat's context. Do it directly, then say in one line that it was small enough to do yourself ("这个很小，我直接做了，没转给 Codex") and that they can force Codex by saying "强制用 codex". If the user already said to use Codex (or "强制 codex"), delegate regardless. Delegate when work is big (many files, long reading, test/fix loops), slow, parallelizable, or wants an independent second opinion.
+Every invocation refreshes `~/.claude/codex-bridge/bin/codex_bridge.py`, a stable symlink to the script. Use that executable for subsequent commands below. Quote paths/arguments containing shell metacharacters or spaces; zsh requires correct quoting. Do not prefix the bridge with `python3`.
 
-## 2. Model & effort: assess difficulty FIRST, choose once, lock for the session
-Before the first call, judge the task (kind + difficulty) and pick ONE model/effort pair. Defaults live in `BR config` (lead gpt-6.1-sol, reasoning gpt-6-astra, bulk gpt-6-luna). Pass `--model/--effort` only when your choice differs from the role's default, or the user named one (the user always wins).
+## Mode and sessions
+- Empty request / review / check / second opinion: `review [--base REF|--commit SHA] [focus]`; `--adversarial` for a tough/risky review. No changes to review: say so and stop. Reviews always get fresh sessions.
+- Bug/stuck: `run --role debugger`; build/edit/refactor: worker; find/explain: explorer; design: architect. Explorer/reviewer/architect are read-only; worker/debugger follow configured sandbox.
+- One need = one `run --name <label>` session. Same label gets or creates that session in this directory; unrelated needs use new labels. `--continue` resumes the newest task session here. Model/effort and sandbox are inherited; concurrent runs on one session are refused.
+- Independent needs with disjoint files can use separate `--background` sessions or `parallel tasks.json` (JSON task list, configured `max_parallel`, default 4). Dependent steps run in order: explorer → worker → reviewer. Never let two runs write the same files.
+- Bulk work uses ONE sol medium lead which fans out up to 20 luna sub-agents; let the lead split it. Split sessions when needs differ.
+- Very simple tasks: do them yourself unless the user explicitly requests Codex (including “强制用 codex”). Simple means most of: ≤2 files / ~15 changed lines, no test-fix loop, a minute's work, quick lookup/explanation, or needs this chat's context. Say “这个很小，我直接做了，没转给 Codex；可说‘强制用 codex’”. Delegate big, slow, parallel work, long reading, test/fix loops, and independent second opinions.
+
+## Choose once, then lock
+Assess difficulty before the first call; state your model/effort and reason in one line. Defaults are configurable. Pass overrides only when departing from role defaults or honoring an explicit user choice.
+
 | Task | Model / effort |
 |---|---|
-| Highly repetitive, simple, many items (bulk edits, per-file/record transforms, extraction, mechanical checks) | lead stays `gpt-6.1-sol` medium and fans out `gpt-6-luna` sub-agents at high (xhigh if items are subtle); or `BR parallel` with luna tasks |
-| Ordinary build/edit/refactor/recon/explain (most tasks, ~80%) | `gpt-6.1-sol` medium |
-| Needs real intelligence: design, tricky logic, ambiguous/conflicting requirements, data-integrity/migration/security-sensitive, hard root cause | `gpt-6-astra` medium; high if genuinely hard |
-| Review (any) | `gpt-6-astra` high (already the default for `review`); `--adversarial` same or xhigh if very risky |
-| xhigh | rare: only for intricate work (concurrency, algorithms, major architecture); say why |
-Say your pick and reason in ONE line before running (e.g. "难度中等偏上，用 astra medium").
-**Lock rule (prompt cache):** inside one Codex session NEVER change model or effort. `--continue`/`resume` always inherit the session's original pair (the script ignores overrides and warns). Sub-agents the Codex lead spawns are exempt; the lead is told (team policy) which model to give them.
-**If the result fails your verification:** do NOT bump effort with `--continue`. Start a NEW session one tier up (sol medium → astra high → astra xhigh) with a fresh self-contained brief that says what was tried and why it failed (the old session stays untouched). Max 2 escalations, then report to the user and say which tier was used.
+| Ordinary build/edit/refactor/recon/explain | gpt-6.1-sol medium |
+| Repetitive bulk edits/transforms/extraction/checks (~10+ independent items) | sol medium lead → up to 20 gpt-6-luna sub-agents, high (xhigh for subtle items); or parallel luna tasks |
+| Design, tricky logic, ambiguity, sensitive data/migrations/security, hard debugging | gpt-6-astra medium; high if genuinely hard |
+| Review | gpt-6-astra high; adversarial same or xhigh if very risky |
+| Intricate concurrency/algorithms/major architecture | xhigh rarely; explain why |
 
-## 3. Supervise (built in, not optional)
-- > ~30s or open-ended → `--background`, then open a live view for the user: `mcp__terminal__run_in_terminal` with `<absolute BR path> watch <id>` (ASCII only, one line, no `cwd`). No terminal tool → poll `BR log <id>` and relay.
-- Narrate in 1–2 plain lines at checkpoints; no raw logs.
-- Big/risky work (many files, delete/rename, migrations, hard to undo, or user wants to see the plan): run `--role architect` first, show the plan, ask approve/adjust (AskUserQuestion), then `worker`. "直接做" skips it.
-- Steering a running job: `BR cancel <id>`, then `BR run --continue "<correction>"` (same model/effort, inherited).
+Within one session NEVER switch model or effort (prompt cache); all resume paths inherit the original pair. Lead-spawned sub-agents are exempt and follow the injected team policy. On a reasoning/quality verification failure, start a NEW session with a self-contained brief describing the failure: sol medium → astra high → astra xhigh. Do not escalate permission/network failures. Maximum two escalations, then report the outcome and tier.
 
-## 4. Hand-off prompt (Codex can't see this chat; keep it tight)
-`Goal` (1 sentence) · `Context` (paths + facts you already know) · `Do`/`Don't touch` · `Done when` (command that must pass) · `Reply with` (files changed + check result, ≤10 lines).
-
-## 5. Verify and report
-Codex's "done" is a claim: check `git diff` and re-run the tests yourself. Reply briefly in the user's language: what Codex actually did (from its activity digest + a few bullets), what you verified, what's open, and how to take over (`attach`) / replay (`log`). Two Codex runs must never write the same files at once.
+## Supervision and handoff
+- Work taking ~30s+ or open-ended: start `--background`. With `mcp__terminal__run_in_terminal`, open `~/.claude/codex-bridge/bin/codex_bridge.py watch <id>`: one ASCII command line, no cwd. This symlink avoids Chinese/non-ASCII installation paths. For a custom bridge home, copy the printed command including its `CODEX_BRIDGE_HOME=...` prefix; the terminal tool requires an ASCII path.
+- No terminal tool: poll `log <id> --since 0`, then use each printed next cursor as `--since`; `status <id> --json` gives compact state. `log <id> --tail N` gives bounded history; `--full` expands details. Relay 1–2 plain lines at checkpoints, not raw logs.
+- Progress → watch; replay → log; stop → `cancel <id>` then inspect `git status`; result → `wait <id>` then `result <id>`; takeover → `attach <id>` and give its quoted resume line. Attach refuses active jobs unless `--force`; normally cancel/wait first. Supervision defaults to newest job in this directory, with a printed notice on global fallback; `--name <label>` selects a local label.
+- Corrections: identify the exact job and its label, `cancel <id>`, then `run --name <same-label> "<correction>"`. Never use implicit latest. For an unnamed job, use `resume --session <recorded-thread-id>` after cancellation.
+- Big/risky work (many files, deletion/renaming, migration, hard to undo, or requested plan): architect first, show plan, ask approve/adjust using AskUserQuestion if available, otherwise normal chat. Existing authorization or “直接做” permits proceeding. Use authorized file/Git/test tools for direct work and verification; if unavailable, report the limitation.
+- Codex's done claim needs verification: inspect `git diff` and rerun the required checks yourself. Report briefly in the user's language: actual changes/activity, verified results, open issues, model/tier, and exact `attach <id>` / `log <id>` commands for takeover/replay.

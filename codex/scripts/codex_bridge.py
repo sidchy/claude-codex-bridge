@@ -17,8 +17,12 @@ Persistent settings: ~/.claude/codex-bridge/settings.json
 Per-call flags override them: --model --effort --sandbox --cd --add-dir --timeout --profile
 """
 import argparse, json, os, shutil, subprocess, sys, tempfile
+import contextlib, fcntl, re, signal, time, hashlib, shlex, selectors
+from pathlib import Path
+from collections import deque
 
-SETTINGS = os.path.expanduser("~/.claude/codex-bridge/settings.json")
+BRIDGE_HOME = os.path.realpath(os.path.expanduser(os.environ.get("CODEX_BRIDGE_HOME", "~/.claude/codex-bridge")))
+SETTINGS = os.path.join(BRIDGE_HOME, "settings.json")
 DEFAULTS = {
     "model": "gpt-6.1-sol",
     "effort": "medium",
@@ -32,6 +36,7 @@ DEFAULTS = {
     "review_model": "gpt-6-astra",     # reviews default to this model + effort
     "review_effort": "high",
     "team_policy": True,               # tell Codex how/when to spawn sub-agents and with which models
+    "max_parallel": 4,
     "roles": {},  # user overrides/additions, merged over ROLES below
 }
 
@@ -40,9 +45,9 @@ DEFAULTS = {
 ROLES = {
     "explorer": {"sandbox": "read-only",
                  "preamble": "ROLE: explorer. Read-only reconnaissance. Do NOT modify files. Find facts fast and report file paths + line numbers + concise findings."},
-    "worker": {"sandbox": "danger-full-access",
+    "worker": {
                  "preamble": "ROLE: worker. Implement exactly the task described, nothing more. Touch only the files named or clearly required. Run the stated check/test command and report the real result."},
-    "debugger": {"sandbox": "danger-full-access",
+    "debugger": {
                  "preamble": "ROLE: debugger. Reproduce first, find the root cause, then make the smallest fix. Report the cause, the fix and proof it works."},
     "reviewer": {"sandbox": "read-only",
                  "preamble": "ROLE: reviewer. Read-only critical review. Report concrete defects ranked by severity with file:line and a failing scenario. Say so explicitly if you find nothing."},
@@ -53,37 +58,112 @@ EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 
 
-def load():
-    s = dict(DEFAULTS)
+@contextlib.contextmanager
+def file_lock(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def atomic_json(path, value):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".bridge-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _load_settings():
     try:
         with open(SETTINGS) as f:
-            s.update(json.load(f))
-    except (OSError, ValueError):
-        pass
-    return s
+            stored = json.load(f)
+        if not isinstance(stored, dict):
+            raise ValueError("expected a JSON object")
+    except FileNotFoundError:
+        if os.path.lexists(SETTINGS):
+            sys.exit(f"cannot read settings {SETTINGS}: broken symlink")
+        stored = {}
+    except (OSError, ValueError) as exc:
+        sys.exit(f"cannot read settings {SETTINGS}: {exc}")
+    try:
+        stored = {k: validate(k, v) for k, v in stored.items()}
+    except SystemExit as exc:
+        sys.exit(f"cannot read settings {SETTINGS}: {exc}")
+    return {**DEFAULTS, **stored}
+
+
+def load():
+    with file_lock(SETTINGS + ".lock"):
+        return _load_settings()
 
 
 def save(s):
-    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-    with open(SETTINGS, "w") as f:
-        json.dump(s, f, indent=2, ensure_ascii=False)
+    with file_lock(SETTINGS + ".lock"):
+        atomic_json(SETTINGS, s)
 
 
 def validate(k, v):
-    if k == "effort" and v not in EFFORTS:
-        sys.exit(f"effort must be one of {sorted(EFFORTS)}")
-    if k == "sandbox" and v not in SANDBOXES:
-        sys.exit(f"sandbox must be one of {sorted(SANDBOXES)}")
-    if k == "timeout":
-        return int(v)
-    if k == "team_policy":
-        return str(v).lower() in ("1", "true", "yes", "on")
-    if k == "review_effort" and v not in EFFORTS:
-        sys.exit(f"review_effort must be one of {sorted(EFFORTS)}")
-    if k == "extra_args":
-        return v.split() if isinstance(v, str) else v
+    def fail(message):
+        sys.exit(f"invalid {k}: {message}")
+
     if k not in DEFAULTS:
-        sys.exit(f"unknown key '{k}'. keys: {', '.join(DEFAULTS)}")
+        fail(f"unknown key; keys: {', '.join(DEFAULTS)}")
+    if k in ("effort", "review_effort"):
+        if not isinstance(v, str) or v not in EFFORTS:
+            fail(f"must be one of {sorted(EFFORTS)}")
+    elif k == "sandbox":
+        if not isinstance(v, str) or v not in SANDBOXES:
+            fail(f"must be one of {sorted(SANDBOXES)}")
+    elif k in ("timeout", "max_parallel"):
+        try:
+            if isinstance(v, bool) or not isinstance(v, (int, str)):
+                raise ValueError()
+            value = int(v)
+            if value < 1:
+                raise ValueError()
+            return value
+        except (ValueError, TypeError):
+            fail("must be a positive integer")
+    elif k == "team_policy":
+        if isinstance(v, bool):
+            return v
+        if str(v).lower() not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+            fail("must be true or false")
+        return str(v).lower() in ("1", "true", "yes", "on")
+    elif k == "roles":
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError as exc:
+                fail(f"expected a JSON object of objects: {exc}")
+        if not isinstance(v, dict):
+            fail("expected a JSON object of objects")
+        for name, role in v.items():
+            if not isinstance(name, str) or not name or not isinstance(role, dict):
+                fail("expected nonempty role names mapped to objects")
+            for field, value in role.items():
+                if field in ("sandbox", "effort"):
+                    validate(field, value)
+                elif field in ("model", "preamble"):
+                    if not isinstance(value, str):
+                        fail(f"{name}.{field} must be a string")
+                else:
+                    fail(f"unknown field {name}.{field}; use sandbox, effort, model, preamble")
+    elif k == "extra_args":
+        if isinstance(v, str):
+            try:
+                v = json.loads(v) if v.lstrip().startswith("[") else shlex.split(v)
+            except ValueError as exc:
+                fail(f"expected JSON array or shell argument string: {exc}")
+        if not isinstance(v, list) or any(not isinstance(arg, str) for arg in v):
+            fail("expected an array of strings")
+    elif not isinstance(v, str):
+        fail("must be a string")
     return v
 
 
@@ -113,33 +193,134 @@ def codex_bin():
 
 
 def cmd_config(a):
-    s = load()
-    if a.action == "reset":
-        save(dict(DEFAULTS)); print("reset to defaults"); s = dict(DEFAULTS)
-    elif a.action == "set":
-        for kv in a.pairs:
-            if "=" not in kv:
-                sys.exit(f"expected key=value, got {kv}")
-            k, v = kv.split("=", 1)
-            s[k] = validate(k, v)
-        save(s)
+    with file_lock(SETTINGS + ".lock"):
+        if a.action == "reset":
+            backup = None
+            try:
+                _load_settings()
+            except SystemExit:
+                backup = SETTINGS + ".corrupt-" + str(time.time_ns())
+                try:
+                    os.replace(SETTINGS, backup)
+                except OSError as exc:
+                    sys.exit(f"cannot back up corrupt settings {SETTINGS}: {exc}")
+            s = dict(DEFAULTS)
+            try:
+                atomic_json(SETTINGS, s)
+            except OSError:
+                if backup:
+                    os.replace(backup, SETTINGS)
+                raise
+            if backup:
+                print(f"preserved corrupt settings: {backup}", file=sys.stderr)
+            print("reset to defaults")
+        else:
+            s = _load_settings()
+            if a.action == "set":
+                for kv in a.pairs:
+                    if "=" not in kv:
+                        sys.exit(f"expected key=value, got {kv}")
+                    k, v = kv.split("=", 1)
+                    s[k] = validate(k, v)
+                atomic_json(SETTINGS, s)
     print(json.dumps(s, indent=2, ensure_ascii=False))
 
 
-def cmd_models(_):
+def model_catalog(cfg=None, cwd=None):
+    settings = load()
+    cfg = cfg or settings
+    binary = codex_bin()
+    profile = cfg.get("profile", "")
+    extra = cfg.get("extra_args", settings["extra_args"])
+    context = {"profile": profile, "extra_args": extra,
+               "cwd": os.path.realpath(cwd or os.getcwd()),
+               "codex_home": os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))}
+    command = [binary] + (["-p", profile] if profile else []) + ["debug", "models"]
+    # Only config overrides apply to catalog lookup; exec-only arguments (e.g.
+    # --add-dir) still participate in the cache key and custom-model exception.
+    for index, arg in enumerate(extra):
+        if arg in ("-c", "--config") and index + 1 < len(extra):
+            command += [arg, extra[index + 1]]
+        elif arg.startswith("--config=") or (arg.startswith("-c") and len(arg) > 2):
+            command.append(arg)
+    path = os.path.join(BRIDGE_HOME, "models.json")
+    with file_lock(path + ".lock"):
+        try:
+            cached = json.loads(Path(path).read_text())
+            if cached.get("binary") == binary and cached.get("context") == context and 0 <= time.time() - cached["fetched"] < 3600:
+                return cached["models"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        try:
+            out = subprocess.run(command, cwd=context["cwd"], capture_output=True, text=True, timeout=30)
+            if out.returncode:
+                raise ValueError(out.stderr.strip() or f"exit {out.returncode}")
+            models = [{k: m.get(k) for k in ("slug", "visibility", "default_reasoning_level", "supported_reasoning_levels")}
+                      for m in json.loads(out.stdout)["models"]]
+            if not models or any(not m["slug"] or not isinstance(m["supported_reasoning_levels"], list) for m in models):
+                raise ValueError("empty or invalid model catalog")
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            sys.exit(f"cannot read model catalog via `codex debug models`: {exc}")
+        atomic_json(path, {"binary": binary, "context": context, "fetched": time.time(), "models": models})
+        return models
+
+
+def custom_model_context(cfg, settings):
+    if cfg.get("profile") or cfg.get("extra_args", settings["extra_args"]) or cfg.get("model_provider"):
+        return True
+    native = Path(os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))) / "config.toml"
     try:
-        out = subprocess.run([codex_bin(), "debug", "models"], capture_output=True, text=True, timeout=30).stdout
-        models = json.loads(out)["models"]
-    except Exception as e:
-        sys.exit(f"cannot read the model catalog via `codex debug models`: {e}")
-    for m in models:
+        text = native.read_text()
+    except OSError:
+        return False
+    try:
+        import tomllib  # Python 3.11+
+        provider = tomllib.loads(text).get("model_provider", "openai")
+    except ImportError:  # python3 may be 3.9: read the top-level key without a TOML parser
+        top = text.split("\n[", 1)[0]
+        m = re.search(r'^\s*model_provider\s*=\s*["\']([^"\']+)["\']', top, re.M)
+        provider = m.group(1) if m else "openai"
+    except ValueError:
+        return False
+    return provider != "openai"
+
+
+def validate_model(cfg, cwd=None):
+    custom = custom_model_context(cfg, load())
+    try:
+        catalog = model_catalog(cfg, cwd)
+    except SystemExit:
+        if not custom:
+            raise
+        # Keep validating known models even if a custom profile's lookup fails.
+        try:
+            catalog = model_catalog({"profile": "", "extra_args": []}, cwd)
+        except SystemExit:
+            catalog = []
+    models = {m["slug"]: m for m in catalog}
+    if cfg["model"] not in models:
+        if custom:
+            print(f"[codex] WARNING: model {cfg['model']!r} is not in the catalog; "
+                  "allowing it for the configured profile/provider/extra_args", file=sys.stderr)
+            return
+        sys.exit(f"unknown model {cfg['model']!r}; available: {', '.join(sorted(models))}; run `models`")
+    efforts = [level["effort"] for level in models[cfg["model"]]["supported_reasoning_levels"]]
+    if cfg["effort"] not in efforts:
+        sys.exit(f"model {cfg['model']} does not support effort {cfg['effort']!r}; supported: {', '.join(efforts)}")
+
+
+def cmd_models(_):
+    for m in model_catalog():
         if m.get("visibility") != "list":
             continue
         lv = [r.get("effort") for r in m.get("supported_reasoning_levels", [])]
         print(f"{m['slug']:<16} default={m.get('default_reasoning_level')}  efforts={','.join(lv)}")
 
 
-def cmd_status(_):
+def cmd_status(a):
+    if getattr(a, "json", False):
+        print(json.dumps(compact_state(_refresh(_resolve_job(a.job, a.name))), separators=(",", ":")))
+        return
     print(subprocess.run([codex_bin(), "--version"], capture_output=True, text=True).stdout.strip())
     print("settings file:", SETTINGS)
     print(json.dumps(load(), indent=2, ensure_ascii=False))
@@ -173,20 +354,64 @@ def resolve(a, s):
     # built-in role defaults that come from settings (flags still win over everything)
     sdef = {"reviewer": {"model": s["review_model"], "effort": s["review_effort"]},
             "architect": {"model": s["model_reasoning"]}}.get(rname, {})
-    g = lambda k: getattr(a, k, None) or role.get(k) or sdef.get(k) or s[k]
+    g = lambda k: next(v for v in (getattr(a, k, None), role.get(k), sdef.get(k), s[k]) if v is not None)
     cfg = {k: g(k) for k in ("model", "effort", "sandbox", "timeout", "profile")}
+    if rname in ("explorer", "reviewer", "architect"):
+        cfg["sandbox"] = getattr(a, "sandbox", None) or "read-only"
     validate("effort", cfg["effort"]); validate("sandbox", cfg["sandbox"])
+    cfg["timeout"] = validate("timeout", cfg["timeout"])
     cfg["preamble"] = role.get("preamble", "")
     if s.get("team_policy") and rname in ("worker", "debugger", "architect"):
         cfg["preamble"] += team_policy(s)
     return cfg
 
 
-def _gitstate(cd):
+HASH_FILE_LIMIT = 200
+HASH_BYTE_LIMIT = 32 * 1024 * 1024
+
+
+def _gitstate(cd, include=()):
     try:
-        out = subprocess.run(["git", "status", "--porcelain"], cwd=cd, capture_output=True, text=True, timeout=20)
-        return set(out.stdout.splitlines()) if out.returncode == 0 else None
-    except Exception:
+        root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cd,
+                              capture_output=True, text=True, timeout=20)
+        if root.returncode:
+            return None
+        out = subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                             cwd=cd, capture_output=True, timeout=20)
+        if out.returncode:
+            return None
+        paths = set(include)
+        records = iter(out.stdout.split(b"\0"))
+        for record in records:
+            if not record:
+                continue
+            paths.add(os.fsdecode(record[3:]))
+            if b"R" in record[:2] or b"C" in record[:2]:
+                paths.add(os.fsdecode(next(records)))
+        hashes, used = {}, 0
+        capped = len(paths) > HASH_FILE_LIMIT
+        for name in sorted(paths)[:HASH_FILE_LIMIT]:
+            path = Path(root.stdout.strip()) / name
+            try:
+                if path.is_symlink():
+                    hashes[name] = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+                elif not path.exists():
+                    hashes[name] = "missing"
+                elif path.is_file():
+                    size = path.stat().st_size
+                    if used + size > HASH_BYTE_LIMIT:
+                        capped = True
+                        continue
+                    used += size
+                    digest = hashlib.sha256()
+                    with path.open("rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            digest.update(chunk)
+                    hashes[name] = digest.hexdigest()
+            except OSError:
+                capped = True
+        return {"hashes": hashes, "capped": capped}
+    except (OSError, subprocess.SubprocessError, StopIteration):
         return None
 
 
@@ -194,15 +419,18 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                jid=None, live=False, kind="task", name=None):
     """Run codex once, streaming events to <run>/events.jsonl. Returns dict(ok, text, thread, error,
     usage, cfg, jid, digest). live=True also prints a readable timeline to stderr as it happens."""
-    import threading
     s = load()
-    cdir = os.path.abspath(cd or os.getcwd())
+    validate_model(cfg, cd)
+    if resume and cfg["sandbox"] not in SANDBOXES:
+        cfg = {**cfg, "sandbox": s["sandbox"]}
+    cdir = os.path.realpath(cd or os.getcwd())
     if jid is None:
         jid = new_run(kind, cfg, prompt, cdir, review, name=name)
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
-    out = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
     cmd = [codex_bin()]
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as output_file:
+        out = output_file.name
     if cfg["profile"]:  # --profile is a top-level option; exec/review/resume reject it
         cmd += ["-p", cfg["profile"]]
     cmd.append("exec")
@@ -215,68 +443,106 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
             "-m", cfg["model"], "-c", f'model_reasoning_effort="{cfg["effort"]}"',
             "-c", 'approval_policy="never"']
     if review is not None:
-        cmd += review
-    elif not resume:  # `resume` doesn't accept -s/-C/--add-dir; it inherits the session
+        cmd += ["-c", f'sandbox_mode="{cfg["sandbox"]}"'] + review
+    elif resume:
+        cmd += ["-c", f'sandbox_mode="{cfg["sandbox"]}"']
+    else:
         cmd += ["-s", cfg["sandbox"], "-C", cdir]
         for d in add_dir or []:
             cmd += ["--add-dir", d]
     cmd += s["extra_args"] + (["-"] if review is None else [])
-    res = {"ok": False, "text": "", "thread": None, "error": "", "usage": None, "cfg": cfg,
+    res = {"ok": False, "text": "", "thread": session, "error": "", "usage": None, "cfg": cfg,
            "jid": jid, "digest": ""}
     before = _gitstate(cdir)
-    evf = open(_job_path(jid, "events.jsonl"), "a", buffering=1)
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, cwd=cdir)
-    timed_out = []
-    timer = threading.Timer(cfg["timeout"], lambda: (timed_out.append(1), p.kill()))
-    timer.start()
-    try:
-        p.stdin.write(prompt or ""); p.stdin.close()
-    except OSError:
-        pass
+    p = None
+    timed_out, cleanup_errors = [], []
     msgs, errors, cmds, failed = [], [], 0, 0
-    for line in p.stdout:
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        evf.write(line if line.endswith("\n") else line + "\n")
-        t = ev.get("type")
-        if t == "thread.started":
-            res["thread"] = ev.get("thread_id")
-            _jwrite(jid, thread=res["thread"])
-        elif t == "item.completed":
-            it = ev.get("item", {})
-            if it.get("type") == "agent_message":
-                msgs.append(it.get("text", ""))
-            elif it.get("type") == "error":
-                errors.append(it.get("message", ""))
-            elif it.get("type") == "command_execution":
-                cmds += 1; failed += (it.get("exit_code") not in (0, None))
-        elif t in ("error", "turn.failed"):
-            errors.append(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False))
-        elif t == "turn.completed":
-            res["usage"] = ev.get("usage")
-        if live:
-            for ln in render_event(ev):
-                print(ln, file=sys.stderr, flush=True)
-    p.wait(); timer.cancel(); evf.close()
+    raw_tail = deque(maxlen=20)
+    final = ""
+    execution_failed = False
+
     try:
-        final = open(out).read().strip()
-        os.unlink(out)
-    except OSError:
-        final = ""
+        with open(_job_path(jid, "events.jsonl"), "a", buffering=1) as evf:
+            # Publish the child group under the same lock used by cancel. A cancellation
+            # before launch must prevent the child from ever being started.
+            with job_state(jid) as st:
+                if st.get("status") != "running":
+                    raise RuntimeError("job was cancelled before launch")
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, cwd=cdir, bufsize=0,
+                                     start_new_session=True)
+                st.update(child_pid=p.pid, pgid=p.pid)
+            for line in child_lines(p, prompt, cfg["timeout"], jid):
+                try:
+                    ev = json.loads(line)
+                    if not isinstance(ev, dict):
+                        raise ValueError("not an event object")
+                except ValueError:
+                    ev = {"type": "raw", "text": line.rstrip("\r\n")}
+                    raw_tail.append(ev["text"][-1000:])
+                evf.write(json.dumps(ev, ensure_ascii=False) + "\n")
+                t = ev.get("type")
+                if t == "thread.started":
+                    res["thread"] = ev.get("thread_id")
+                    _jwrite(jid, thread=res["thread"])
+                elif t == "item.completed":
+                    it = ev.get("item", {})
+                    if it.get("type") == "agent_message":
+                        msgs.append(it.get("text", ""))
+                    elif it.get("type") == "error":
+                        errors.append(it.get("message", ""))
+                    elif it.get("type") == "command_execution":
+                        cmds += 1
+                        failed += it.get("exit_code") not in (0, None)
+                elif t in ("error", "turn.failed"):
+                    execution_failed = True
+                    errors.append(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False))
+                elif t == "turn.completed":
+                    res["usage"] = ev.get("usage")
+                if live:
+                    for ln in render_event(ev):
+                        print(ln, file=sys.stderr, flush=True)
+            p.wait(timeout=REAP_TIMEOUT)
+            final = Path(out).read_text().strip()
+    except subprocess.TimeoutExpired:
+        timed_out.append(True)
+    except Exception as exc:
+        execution_failed = True
+        errors.append(f"codex execution failed: {exc}")
+    finally:
+        if p:
+            try:
+                if timed_out or execution_failed or p.poll() is None:
+                    terminate_group(p.pid, process=p, jid=jid)
+            except (OSError, subprocess.SubprocessError) as exc:
+                cleanup_errors.append(str(exc))
+            try:
+                p.wait(timeout=REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                cleanup_errors.append("codex did not exit before the final wait deadline")
+            for pipe in (p.stdin, p.stdout):
+                if pipe:
+                    pipe.close()
+        Path(out).unlink(missing_ok=True)
     res["text"] = final or (msgs[-1] if msgs else "")
-    res["ok"] = p.returncode == 0 and bool(res["text"]) and not timed_out
+    res["ok"] = bool(p and p.returncode == 0 and res["text"] and not timed_out and not execution_failed and not cleanup_errors)
     if not res["ok"]:
         res["error"] = (f"codex timed out after {cfg['timeout']}s" if timed_out
-                        else "\n".join(errors) or f"exit {p.returncode}")
-    after = _gitstate(cdir)
-    changed = sorted(l.strip() for l in (after - before)) if before is not None and after is not None else None
+                        else "\n".join(errors) or f"exit {p.returncode if p else 'not started'}")
+        if raw_tail:
+            res["error"] += "\nCLI output tail:\n" + "\n".join(raw_tail)[-4000:]
+        if cleanup_errors:
+            res["error"] += "\nprocess cleanup failed: " + "; ".join(cleanup_errors)
+    after = _gitstate(cdir, before["hashes"] if before else ())
+    changed = (sorted(name for name, digest in after["hashes"].items()
+                      if before["hashes"].get(name) != digest)
+               if before is not None and after is not None else None)
     u = res["usage"] or {}
     parts = [f"{cmds} commands" + (f" ({failed} failed)" if failed else "")]
     if changed is not None:
-        parts.append("files changed: " + (", ".join(changed[:15]) + (" ..." if len(changed) > 15 else "") if changed else "none"))
+        parts.append("files touched: " + (", ".join(changed[:15]) + (" ..." if len(changed) > 15 else "") if changed else "none"))
+    if (before and before["capped"]) or (after and after["capped"]):
+        parts.append(f"hash snapshot capped ({HASH_FILE_LIMIT} files / {HASH_BYTE_LIMIT} bytes); touched list incomplete")
     parts.append(f"tokens in/out {u.get('input_tokens', '?')}/{u.get('output_tokens', '?')}")
     res["digest"] = " · ".join(parts)
     _jwrite(jid, digest=res["digest"], thread=res["thread"])
@@ -291,6 +557,8 @@ def _short(t, n=160):
 def render_event(ev, full=False):
     """Turn one codex JSONL event into human-readable lines ([] = skip)."""
     t = ev.get("type"); it = ev.get("item", {}) or {}; ty = it.get("type")
+    if t == "raw":
+        return [ev.get("text", "") if full else _short(ev.get("text", ""), 400)]
     if t == "turn.started":
         return ["── turn started ──"]
     if t == "turn.completed":
@@ -333,75 +601,117 @@ def header(cfg, role=None):
             f"sandbox={cfg['sandbox']}")
 
 
+def bridge_command(*args):
+    command = shlex.join([os.path.join(BRIDGE_HOME, "bin", "codex_bridge.py"), *args])
+    default_home = os.path.realpath(os.path.expanduser("~/.claude/codex-bridge"))
+    if BRIDGE_HOME != default_home:
+        command = f"CODEX_BRIDGE_HOME={shlex.quote(BRIDGE_HOME)} " + command
+    return command
+
+
 def print_footer(r):
-    me = os.path.abspath(__file__)
     print(f"\n--- Codex activity: {r['digest']}\n    run {r['jid']} · session {r['thread']}"
-          f"\n    transcript: {me} log {r['jid']}\n    take over : {me} attach {r['jid']}")
+          f"\n    transcript: {bridge_command('log', r['jid'])}"
+          f"\n    take over : {bridge_command('attach', r['jid'])}")
 
 
 def find_session(cwd=None, thread=None, name=None):
     """Look up a Codex session recorded by this bridge: newest task/resume session in `cwd`,
     or the one with id `thread`. Returns the job state (has thread/model/effort) or None."""
+    cwd = os.path.realpath(cwd) if cwd else None
     if not os.path.isdir(JOBS):
         return None
-    for jid in sorted(os.listdir(JOBS), reverse=True):
+    for jid in ordered_jobs():
         st = _jread(jid) or {}
         if not st.get("thread"):
             continue
         if thread and st["thread"] == thread:
             return st
-        if name and st.get("name") == name and st.get("cwd") == cwd:
+        if name and st.get("name") == name and os.path.realpath(st.get("cwd", "")) == cwd:
             return st
-        if not thread and not name and st.get("cwd") == cwd and st.get("kind") in ("task", "resume"):
+        if not thread and not name and os.path.realpath(st.get("cwd", "")) == cwd and st.get("kind") in ("task", "resume"):
             return st
     return None
 
 
-def run_codex(a, resume):
+def prepare_run(a, resume):
     cfg = resolve(a, load())
     session = getattr(a, "session", None)
     label = getattr(a, "name", None)
-    cwd_ = os.path.abspath(a.cd or os.getcwd())
-    if label and not session and not resume:  # named session = get-or-create
-        if find_session(cwd=cwd_, name=label):
-            a.cont = True
-    if getattr(a, "cont", False) or (resume and not session):
-        st = (find_session(thread=session) if session else
-              find_session(cwd=cwd_, name=label) if label else find_session(cwd=cwd_))
-        if st:
-            session, resume = st["thread"], True
-            # Never switch model/effort inside a session: it would break the prompt cache.
-            for k in ("model", "effort"):
-                asked = getattr(a, k, None)
-                if asked and asked != st.get(k):
-                    print(f"[codex] ignoring --{k} {asked}: this session runs {st.get('model')}/{st.get('effort')} "
-                          f"and is never switched (cache). To change it, start a NEW session with `run`.", file=sys.stderr)
-                cfg[k] = st.get(k, cfg[k])
-        elif resume and not session:
-            sys.exit("no earlier Codex session from this bridge in this directory; start with `run`")
-        elif resume:
-            print("[codex] session not recorded by this bridge; resuming with the given model/effort "
-                  "(keep them identical to the original run or the cache is lost)", file=sys.stderr)
-        else:
-            print("[codex] --continue: no earlier session here, starting a new one", file=sys.stderr)
+    cwd_ = os.path.realpath(a.cd or os.getcwd())
+    if label:
+        for jid in os.listdir(JOBS) if os.path.isdir(JOBS) else []:
+            st = _refresh(jid)
+            if st.get("name") == label and os.path.realpath(st.get("cwd", "")) == cwd_ and st.get("status") in ACTIVE:
+                sys.exit(f"session {label!r} already has active job {jid}; cancel or wait for it first")
+    st = (find_session(thread=session) if session else
+          find_session(cwd=cwd_, name=label) if label else
+          find_session(cwd=cwd_) if resume or getattr(a, "cont", False) else None)
+    if st:
+        session, resume = st["thread"], True
+        label = label or st.get("name")
+        # Every entry point uses the same metadata and locks the original pair.
+        for k in ("model", "effort", "sandbox"):
+            asked = cfg[k]
+            inherited = st.get(k, "unknown" if k == "sandbox" else cfg[k])
+            if asked != inherited:
+                print(f"[codex] ignoring requested {k}={asked}: session {session} inherits "
+                      f"{k}={inherited}. To change it, start a NEW session with `run`.", file=sys.stderr)
+            cfg[k] = inherited
+        cfg["profile"] = st.get("profile", cfg["profile"])
+    elif session:
+        resume = True
+        cfg["sandbox"] = "unknown"
+        print(f"[codex] WARNING: session {session} is not recorded by this bridge; model/effort "
+              "cannot be verified. Keep the original pair; the configured sandbox default will apply.", file=sys.stderr)
+    elif label:
+        resume = False  # a new named session must never fall through to native --last
+    elif resume:
+        sys.exit("no earlier Codex session from this bridge in this directory; start with `run`")
+    elif getattr(a, "cont", False):
+        print("[codex] --continue: no earlier session here, starting a new one", file=sys.stderr)
+    if session and cfg["sandbox"] not in SANDBOXES:
+        cfg["sandbox"] = load()["sandbox"]
+        print(f"[codex] WARNING: sandbox was not recorded; applying configured default {cfg['sandbox']}", file=sys.stderr)
+    if session:
+        for jid in os.listdir(JOBS) if os.path.isdir(JOBS) else []:
+            active = _refresh(jid)
+            if active.get("thread") == session and active.get("status") in ACTIVE:
+                sys.exit(f"session {session} already has active job {jid}; cancel or wait for it first")
     prompt = a.prompt
     if prompt in (None, "-"):
         prompt = sys.stdin.read()
     if not prompt.strip():
         sys.exit("empty prompt")
     print(header(cfg, getattr(a, "role", None)) + (" (session inherited)" if resume else ""), file=sys.stderr)
+    validate_model(cfg, cwd_)
+    jid = new_run("resume" if resume else "task", cfg, prompt, cwd_, name=label)
+    if session:
+        _jwrite(jid, thread=session)
+    return cfg, prompt, session, resume, label, jid
+
+
+def run_codex(a, resume):
+    if a.prompt in (None, "-"):
+        a.prompt = sys.stdin.read()
+    label = getattr(a, "name", None)
+    identity = json.dumps([os.path.realpath(a.cd or os.getcwd()), label])
+    lock = os.path.join(BRIDGE_HOME, "sessions", hashlib.sha256(identity.encode()).hexdigest() + ".lock")
+    with file_lock(lock) if label else contextlib.nullcontext():
+        with file_lock(os.path.join(BRIDGE_HOME, "sessions", "index.lock")):
+            cfg, prompt, session, resume, label, jid = prepare_run(a, resume)
     if a.background:
-        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, session, name=label)
+        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, session, name=label, jid=jid)
     r = exec_codex(cfg, prompt, a.cd, a.add_dir, session, resume, live=True,
-                   kind="resume" if resume else "task", name=label)
+                   kind="resume" if resume else "task", name=label, jid=jid)
     finish_run(r)
     if not r["ok"]:
-        sys.exit(f"CODEX FAILED: {r['error']}\n(run {r['jid']}; transcript: codex_bridge.py log {r['jid']})")
+        sys.exit(f"CODEX FAILED: {r['error']}\n(run {r['jid']}; transcript: {bridge_command('log', r['jid'])})")
     print(r["text"])
     print_footer(r)
 
 
-JOBS = os.path.expanduser("~/.claude/codex-bridge/jobs")
+JOBS = os.path.join(BRIDGE_HOME, "jobs")
 ADVERSARIAL = ("You are performing an ADVERSARIAL review. Your job is to break confidence in the change, not to "
                "validate it: assume it can fail in subtle, costly ways. Hunt for auth/trust-boundary gaps, data loss, "
                "rollback/retry/idempotency holes, races, empty/null/timeout behaviour, version/schema drift, and "
@@ -414,35 +724,239 @@ def _job_path(jid, name):
     return os.path.join(JOBS, jid, name)
 
 
-def _jwrite(jid, **kw):
-    import fcntl
+@contextlib.contextmanager
+def job_state(jid):
     path = _job_path(jid, "state.json")
-    with open(_job_path(jid, "state.lock"), "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)  # serialize read-modify-write across processes
-        st = {}
-        try:
-            st = json.load(open(path))
-        except (OSError, ValueError):
-            pass
-        st.update(kw)
+    with open(_job_path(jid, "state.lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        st = _jread(jid) or {}
+        yield st
         tmp = path + ".tmp"
-        json.dump(st, open(tmp, "w"), ensure_ascii=False)
-        os.replace(tmp, path)  # atomic publish: readers never see a partial file
+        with open(tmp, "w") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, path)
+
+
+def _jwrite(jid, **kw):
+    with job_state(jid) as st:
+        st.update(kw)
 
 
 def _jread(jid):
     try:
-        return json.load(open(_job_path(jid, "state.json")))
+        with open(_job_path(jid, "state.json")) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return None
 
 
+ACTIVE = {"running", "cancelling"}
+CANCEL_GRACE = 1.0
+
+
+PS_TIMEOUT = 0.5
+REAP_TIMEOUT = 1.0
+PIPE_DRAIN_TIMEOUT = 1.0
+
+
+def process_snapshot():
+    """None means enumeration unavailable, not an empty process table."""
+    try:
+        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="],
+                                capture_output=True, text=True, timeout=PS_TIMEOUT)
+        if result.returncode:
+            return None
+        rows = {}
+        for line in result.stdout.splitlines():
+            pid, parent, group, status = line.split()
+            rows[int(pid)] = (int(parent), int(group), status)
+        return rows or None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def _alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
-    except (OSError, TypeError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True  # lack of permission is not proof of exit
+
+
+def group_alive(pgid, snapshot=None):
+    if not isinstance(pgid, int) or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if snapshot is None:
+        snapshot = process_snapshot()
+    if snapshot is None:
+        return True
+    return any(group == pgid and not status.startswith("Z") for _, group, status in snapshot.values())
+
+
+def collect_descendants(root, pids, groups, snapshot):
+    """Close over the entire tree, including tools that created new sessions."""
+    pids.add(root)
+    groups.add(root)
+    if snapshot is not None:
+        while True:
+            previous = len(pids)
+            for pid, (parent, group, status) in snapshot.items():
+                if pid in pids or parent in pids or group in groups:
+                    pids.add(pid)
+                    if group > 1 and group != os.getpgrp():
+                        groups.add(group)
+            if len(pids) == previous:
+                break
+    pids.discard(os.getpid())
+    groups.discard(os.getpgrp())
+
+
+def remember_processes(jid, pids, groups, scan_failed=False):
+    if jid is None:
+        return
+    with job_state(jid) as st:
+        st["tracked_pids"] = sorted(set(st.get("tracked_pids", [])) | pids)
+        st["tracked_pgids"] = sorted(set(st.get("tracked_pgids", [])) | groups)
+        if scan_failed:
+            st["process_scan_warning"] = "ps unavailable; cleanup falls back to recorded processes/groups"
+
+
+def targets_alive(pids, groups, snapshot):
+    if snapshot is not None:
+        return any((pid in pids or group in groups) and not status.startswith("Z")
+                   for pid, (_, group, status) in snapshot.items())
+    for pid in pids:
+        if _alive(pid):
+            return True
+    for group in groups:
+        try:
+            os.killpg(group, 0)
+            return True
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return True
+    return False
+
+
+def terminate_group(pgid, process=None, jid=None):
+    """Terminate the recorded group AND all discovered descendants, with bounds."""
+    if not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
+        raise OSError(f"unsafe or missing process group: {pgid}")
+    st = _jread(jid) or {} if jid else {}
+    pids, groups = set(st.get("tracked_pids", [])), set(st.get("tracked_pgids", []))
+    failures = []
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        snapshot = process_snapshot()
+        collect_descendants(pgid, pids, groups, snapshot)
+        # Persist BEFORE signalling, so an interrupted cancel can be refreshed safely.
+        remember_processes(jid, pids, groups, snapshot is None)
+        deadline = time.monotonic() + CANCEL_GRACE
+        signalled_pids, signalled_groups = set(), set()
+        while True:
+            # Signal descendants first, the root last. Newly found children are
+            # included even if a parent forks during the grace period.
+            for group in sorted(groups - signalled_groups, key=lambda g: g == pgid):
+                try:
+                    os.killpg(group, sig)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    failures.append(str(exc))
+                signalled_groups.add(group)
+            for pid in sorted(pids - signalled_pids, key=lambda pid: pid == pgid):
+                if pid <= 1 or pid == os.getpid():
+                    continue
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    failures.append(str(exc))
+                signalled_pids.add(pid)
+            if process:
+                process.poll()
+            snapshot = process_snapshot()
+            if not targets_alive(pids, groups, snapshot):
+                return
+            if time.monotonic() >= deadline:
+                break
+            collect_descendants(pgid, pids, groups, snapshot)
+            remember_processes(jid, pids, groups, snapshot is None)
+            time.sleep(0.05)
+    raise OSError("process tree still alive or exit unconfirmed after SIGKILL" +
+                  (": " + "; ".join(failures[-3:]) if failures else ""))
+
+
+def child_lines(process, prompt, timeout, jid):
+    """Nonblocking pipes: neither partial stdout nor unread stdin can defeat a deadline."""
+    deadline = time.monotonic() + timeout
+    drain_deadline = cancel_deadline = None
+    next_scan = 0
+    pending = memoryview((prompt or "").encode())
+    buffer = b""
+    pids, groups = {process.pid}, {process.pid}
+    with selectors.DefaultSelector() as selector:
+        for pipe in (process.stdin, process.stdout):
+            os.set_blocking(pipe.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if pending:
+            selector.register(process.stdin, selectors.EVENT_WRITE)
+        else:
+            process.stdin.close()
+        while selector.get_map() or process.poll() is None:
+            now = time.monotonic()
+            if now >= deadline:
+                raise subprocess.TimeoutExpired("codex", timeout)
+            if now >= next_scan:
+                snapshot = process_snapshot()
+                collect_descendants(process.pid, pids, groups, snapshot)
+                remember_processes(jid, pids, groups, snapshot is None)
+                next_scan = time.monotonic() + 0.5
+            if (_jread(jid) or {}).get("status") in ("cancelling", "cancelled"):
+                if cancel_deadline is None:
+                    cancel_deadline = now + 2 * CANCEL_GRACE + 2 * PS_TIMEOUT + REAP_TIMEOUT
+                if now >= cancel_deadline:
+                    raise RuntimeError("cancelled job exceeded its pipe/exit deadline")
+            if process.poll() is not None:
+                drain_deadline = drain_deadline or now + PIPE_DRAIN_TIMEOUT
+                if now >= drain_deadline:
+                    raise RuntimeError("codex exited but a descendant kept stdout open")
+            for key, mask in selector.select(timeout=min(0.1, max(0, deadline - now))):
+                if key.fileobj is process.stdin:
+                    try:
+                        pending = pending[os.write(process.stdin.fileno(), pending[:65536]):]
+                    except BrokenPipeError:
+                        pending = pending[len(pending):]
+                    except BlockingIOError:
+                        continue
+                    if not pending:
+                        selector.unregister(process.stdin)
+                        process.stdin.close()
+                else:
+                    try:
+                        chunk = os.read(process.stdout.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        yield line.decode("utf-8", errors="replace")
+                    if not chunk:
+                        selector.unregister(process.stdout)
+                        if buffer:
+                            yield buffer.decode("utf-8", errors="replace")
+                            buffer = b""
 
 
 def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
@@ -450,69 +964,131 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     os.makedirs(os.path.join(JOBS, jid))
     if spec:
-        json.dump(spec, open(_job_path(jid, "spec.json"), "w"), ensure_ascii=False)
-    _jwrite(jid, id=jid, kind=kind, status="running", cwd=cd, model=cfg["model"], effort=cfg["effort"],
-            started=time.time(), pid=os.getpid(), name=name,
+        Path(_job_path(jid, "spec.json")).write_text(json.dumps(spec, ensure_ascii=False))
+    _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.realpath(cd), model=cfg["model"], effort=cfg["effort"],
+            started=time.time(), pid=os.getpid(), pgid=None, name=name, sandbox=cfg["sandbox"], profile=cfg["profile"],
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
     return jid
 
 
 def finish_run(r):
-    import time
-    st = _jread(r["jid"]) or {}
-    if st.get("status") == "cancelled":
-        return
-    open(_job_path(r["jid"], "result.txt"), "w").write(r["text"] if r["ok"] else "FAILED: " + r["error"])
-    _jwrite(r["jid"], status="done" if r["ok"] else "failed", usage=r["usage"], finished=time.time())
+    with job_state(r["jid"]) as st:
+        if st.get("status") in ("cancelling", "cancelled"):
+            st["worker_finished"] = True
+            return
+        Path(_job_path(r["jid"], "result.txt")).write_text(r["text"] if r["ok"] else "FAILED: " + r["error"])
+        st.update(status="done" if r["ok"] else "failed", usage=r["usage"],
+                  error=r["error"], finished=time.time())
 
 
-def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None, name=None):
-    cd = os.path.abspath(cd or os.getcwd())
-    jid = new_run(kind, cfg, prompt, cd, review, name=name,
-                  spec={"cfg": cfg, "prompt": prompt, "cd": cd, "add_dir": add_dir,
-                        "resume": resume, "session": session, "review": review})
-    log = open(_job_path(jid, "log.txt"), "w")
-    pr = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_job", jid],
-                          stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-    _jwrite(jid, pid=pr.pid)
-    print(f"started background job {jid} ({kind}, {cfg['model']} {cfg['effort']}).\n"
-          f"  watch live : {os.path.abspath(__file__)} watch {jid}\n"
-          f"  other      : jobs | log {jid} | result {jid} | wait {jid} | cancel {jid} | attach {jid}")
+def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None, name=None, jid=None):
+    cd = os.path.realpath(cd or os.getcwd())
+    if jid is None:
+        jid = new_run(kind, cfg, prompt, cd, review, name=name)
+    atomic_json(_job_path(jid, "spec.json"),
+                {"cfg": cfg, "prompt": prompt, "cd": cd, "add_dir": add_dir,
+                 "resume": resume, "session": session, "review": review})
+    try:
+        with job_state(jid) as st:
+            if st.get("status") != "running":
+                print(f"job {jid} is {st.get('status')}; worker was not launched")
+                return
+            with open(_job_path(jid, "log.txt"), "w") as log:
+                pr = subprocess.Popen([sys.executable, os.path.realpath(__file__), "_job", jid],
+                                      stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
+                                      env={**os.environ, "CODEX_BRIDGE_HOME": BRIDGE_HOME})
+            st["pid"] = pr.pid
+    except OSError as exc:
+        finish_run({"jid": jid, "ok": False, "text": "", "error": f"cannot launch worker: {exc}", "usage": None})
+        sys.exit(f"cannot launch worker: {exc}")
+    print(f"started background job {jid} ({kind}, {cfg['model']} {cfg['effort']}).")
+    for label, command in (("watch live", "watch"), ("transcript", "log"), ("result", "result"),
+                           ("wait", "wait"), ("cancel", "cancel"), ("take over", "attach")):
+        print(f"  {label:<10}: {bridge_command(command, jid)}")
+
 
 
 def cmd__job(a):
     jid = a.jid
-    spec = json.load(open(_job_path(jid, "spec.json")))
-    r = exec_codex(spec["cfg"], spec["prompt"], spec["cd"], spec["add_dir"], spec["session"],
-                   spec["resume"], spec["review"], jid=jid)
+    try:
+        spec = json.loads(Path(_job_path(jid, "spec.json")).read_text())
+        r = exec_codex(spec["cfg"], spec["prompt"], spec["cd"], spec["add_dir"], spec["session"],
+                       spec["resume"], spec["review"], jid=jid)
+    except (Exception, SystemExit) as exc:
+        r = {"jid": jid, "ok": False, "text": "", "error": str(exc), "usage": None}
     finish_run(r)
 
 
-def _resolve_job(ref):
-    if not os.path.isdir(JOBS):
-        sys.exit("no jobs yet")
-    ids = sorted(os.listdir(JOBS))
+def ordered_jobs():
+    states = [(jid, _jread(jid)) for jid in os.listdir(JOBS)] if os.path.isdir(JOBS) else []
+    return [jid for jid, st in sorted(((jid, st) for jid, st in states if st),
+                                     key=lambda pair: pair[1].get("started", 0), reverse=True)]
+
+
+def scoped_jobs(name=None):
+    ids = ordered_jobs()
+    cwd = os.path.realpath(os.getcwd())
+    local = [jid for jid in ids if (st := _jread(jid))
+             and os.path.realpath(st.get("cwd", "")) == cwd
+             and (not name or st.get("name") == name)]
+    if local or name:
+        return local
+    if ids:
+        print(f"[codex] no jobs in {cwd}; falling back to global newest", file=sys.stderr)
+    return ids
+
+
+def _resolve_job(ref=None, name=None):
+    if name:
+        if ref not in (None, "last"):
+            sys.exit("choose either a job id or --name")
+        ids = scoped_jobs(name)
+        if not ids:
+            sys.exit(f"no job named {name!r} in the current directory")
+        return ids[0]
     if ref in (None, "last"):
+        ids = scoped_jobs()
         if not ids:
             sys.exit("no jobs yet")
-        return ids[-1]
-    m = [i for i in ids if i == ref or i.endswith(ref)]
-    if len(m) != 1:
+        return ids[0]
+    ids = os.listdir(JOBS) if os.path.isdir(JOBS) else []
+    matches = [i for i in ids if i == ref or i.endswith(ref)]
+    if len(matches) != 1:
         sys.exit(f"job '{ref}' not found or ambiguous")
-    return m[0]
+    return matches[0]
 
 
 def _refresh(jid):
-    st = _jread(jid) or {}
-    if st.get("status") == "running" and not _alive(st.get("pid")):
-        _jwrite(jid, status="failed", error="worker process died")
-        st = _jread(jid)
-    return st
+    with job_state(jid) as st:
+        if st.get("status") in ACTIVE:
+            snapshot = process_snapshot()
+            worker_alive = (st.get("pid") in snapshot and not snapshot[st["pid"]][2].startswith("Z")) if snapshot is not None else _alive(st.get("pid"))
+            worker_alive = worker_alive and not st.get("worker_finished")
+            pids = set(st.get("tracked_pids", []))
+            groups = set(st.get("tracked_pgids", []))
+            if st.get("child_pid"):
+                pids.add(st["child_pid"])
+            if st.get("pgid"):
+                groups.add(st["pgid"])
+            execution_alive = targets_alive(pids, groups, snapshot)
+            if not worker_alive and not execution_alive:
+                if st["status"] == "cancelling":
+                    st.update(status="cancelled", finished=time.time())
+                else:
+                    st.update(status="failed", error="worker process died")
+        return dict(st)
+
+
+def compact_state(st):
+    return {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error")}
 
 
 def cmd_jobs(a):
     import time
-    ids = sorted(os.listdir(JOBS), reverse=True)[:a.limit] if os.path.isdir(JOBS) else []
+    ids = scoped_jobs(getattr(a, "name", None))[:a.limit]
+    if getattr(a, "json", False):
+        print(json.dumps([compact_state(_refresh(jid)) for jid in ids], separators=(",", ":")))
+        return
     if not ids:
         print("no jobs"); return
     print(f"{'ID':<17}{'KIND':<8}{'STATUS':<10}{'AGE':<7}{'MODEL/EFFORT':<22}TASK")
@@ -524,18 +1100,18 @@ def cmd_jobs(a):
 
 
 def cmd_result(a):
-    jid = _resolve_job(a.job); st = _refresh(jid)
-    if st["status"] == "running":
+    jid = _resolve_job(a.job, getattr(a, "name", None)); st = _refresh(jid)
+    if st["status"] in ACTIVE:
         print(f"job {jid} still running"); return
-    print(open(_job_path(jid, "result.txt")).read() if os.path.exists(_job_path(jid, "result.txt"))
+    print(Path(_job_path(jid, "result.txt")).read_text() if os.path.exists(_job_path(jid, "result.txt"))
           else f"job {jid}: {st['status']} ({st.get('error','no output')})")
     print(f"\n[job {jid} {st['status']} session={st.get('thread')}]", file=sys.stderr)
 
 
 def cmd_wait(a):
     import time
-    jid = _resolve_job(a.job); t0 = time.time()
-    while _refresh(jid)["status"] == "running":
+    jid = _resolve_job(a.job, getattr(a, "name", None)); t0 = time.time()
+    while _refresh(jid)["status"] in ACTIVE:
         if time.time() - t0 > a.timeout:
             print(f"job {jid} still running after {a.timeout}s"); return
         time.sleep(3)
@@ -543,66 +1119,104 @@ def cmd_wait(a):
 
 
 def cmd_cancel(a):
-    import signal
-    jid = _resolve_job(a.job); st = _refresh(jid)
-    if st["status"] != "running":
-        print(f"job {jid} is {st['status']}"); return
-    _jwrite(jid, status="cancelled")
+    jid = _resolve_job(a.job, getattr(a, "name", None))
+    with job_state(jid) as st:
+        if st.get("status") not in ACTIVE:
+            print(f"job {jid} is {st.get('status')}")
+            return
+        st["status"] = "cancelling"
+        st.setdefault("cancel_reason", "cancel requested")
+        pgid = st.get("pgid")
+        legacy = "pgid" not in st
     try:
-        os.killpg(st["pid"], signal.SIGTERM)
-    except OSError:
-        pass
+        if legacy:
+            raise OSError("no execution process group recorded for this legacy job; cannot safely confirm cancellation")
+        if pgid is not None:
+            terminate_group(pgid, jid=jid)
+    except OSError as exc:
+        _jwrite(jid, error=f"cancellation failed: {exc}")
+        sys.exit(f"cancellation failed for {jid}: {exc}; status remains cancelling")
+    with job_state(jid) as st:
+        st.update(status="cancelled", finished=time.time())
     print(f"cancelled {jid}")
 
 
-def _stream(jid, follow, full=False):
-    import time
+def _stream(jid, follow, full=False, since=0, tail=None):
+    if since < 0 or (tail is not None and tail < 0):
+        sys.exit("--since and --tail must be nonnegative")
     path = _job_path(jid, "events.jsonl")
-    for _ in range(100):  # wait for the log file to appear
-        if os.path.exists(path): break
-        time.sleep(0.2)
-    else:
-        sys.exit(f"no event log for {jid}")
+    if follow:
+        while not os.path.exists(path) and _refresh(jid).get("status") in ACTIVE:
+            time.sleep(0.2)
+    if not os.path.exists(path):
+        print("next cursor: 0")
+        return
     st = _jread(jid) or {}
-    print(f"═ codex run {jid} · {st.get('model')} {st.get('effort')} · {st.get('cwd')}\n═ {st.get('title','')}", flush=True)
+    if follow:
+        print(f"═ codex run {jid} · {st.get('model')} {st.get('effort')} · {st.get('cwd')}", flush=True)
+    cursor = 0
     with open(path) as f:
-        while True:
-            line = f.readline()
-            if line:
-                try:
-                    ev = json.loads(line)
-                    for ln in render_event(ev, full):
-                        print(ln, flush=True)
-                    if ev.get("type") in ("turn.completed", "turn.failed"):
-                        break  # the turn is over; don't wait for codex's slow shutdown
-                except ValueError:
-                    pass
-                continue
-            if not follow or _refresh(jid).get("status") != "running":
-                break
-            time.sleep(0.5)
-    import time
-    for _ in range(40):  # let the job record its final status/digest
+        if tail is not None:
+            lines = deque(maxlen=tail)
+            for index, line in enumerate(f, 1):
+                if line.endswith("\n"):
+                    cursor = index
+                    if index > since:
+                        lines.append(line)
+            for line in lines:
+                for rendered in render_event(json.loads(line), full):
+                    print(rendered)
+        else:
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if line and line.endswith("\n"):
+                    cursor += 1
+                    if cursor > since:
+                        try:
+                            for rendered in render_event(json.loads(line), full):
+                                print(rendered, flush=True)
+                        except ValueError:
+                            pass
+                    continue
+                f.seek(offset)  # do not consume an event still being written
+                if not follow or _refresh(jid).get("status") not in ACTIVE:
+                    break
+                time.sleep(0.5)
+    if follow:
         st = _refresh(jid)
-        if st.get("status") != "running" or not follow:
-            break
-        time.sleep(0.5)
-    print(f"═ {st.get('status')} · {st.get('digest','')}", flush=True)
+        print(f"═ {st.get('status')} · {st.get('digest', '')}")
+    print(f"next cursor: {cursor}", flush=True)
 
 
 def cmd_watch(a):
-    _stream(_resolve_job(a.job), follow=True)
+    _stream(_resolve_job(a.job, getattr(a, "name", None)), follow=True)
 
 
 def cmd_log(a):
-    _stream(_resolve_job(a.job), follow=False, full=a.full)
+    _stream(_resolve_job(a.job, getattr(a, "name", None)), follow=False, full=a.full,
+            since=getattr(a, "since", 0), tail=getattr(a, "tail", None))
 
 
 def cmd_attach(a):
-    jid = _resolve_job(a.job); st = _jread(jid) or {}
+    jid = _resolve_job(a.job, getattr(a, "name", None)); st = _refresh(jid)
+    if st.get("status") in ACTIVE and not getattr(a, "force", False):
+        sys.exit(f"job {jid} is still {st['status']}; cancel/wait first, or use attach --force")
     if not st.get("thread"):
         sys.exit("no codex session id recorded yet for this run")
-    print(f"cd {st['cwd']} && {codex_bin()} resume {st['thread']}")
+    cmd = [codex_bin()]
+    if st.get("profile"):
+        cmd += ["-p", st["profile"]]
+    cmd += ["resume", st["thread"]]
+    if st.get("model"):
+        cmd += ["-m", st["model"]]
+    if st.get("effort"):
+        cmd += ["-c", f'model_reasoning_effort="{st["effort"]}"']
+    sandbox = st.get("sandbox")
+    if sandbox not in SANDBOXES:
+        sandbox = load()["sandbox"]
+    cmd += ["-c", f'sandbox_mode="{sandbox}"', "-c", 'approval_policy="never"']
+    print(f"cd {shlex.quote(st['cwd'])} && {shlex.join(cmd)}")
     print("# Run the line above in a terminal to continue this exact Codex session interactively (you drive).", file=sys.stderr)
 
 
@@ -610,6 +1224,7 @@ def cmd_review(a):
     a.role = "reviewer"  # review_model/review_effort from settings unless --model/--effort given
     cfg = resolve(a, load())
     cfg["sandbox"] = "read-only"
+    validate_model(cfg, a.cd)
     focus = " ".join(a.focus).strip()
     if a.commit:
         target, tflags, desc = "the changes introduced by commit " + a.commit, ["--commit", a.commit], f"`git show {a.commit}`"
@@ -640,20 +1255,28 @@ def cmd_parallel(a):
     [{"name":"a","role":"explorer","prompt":"...","cd":"/path","model":..,"effort":..,"sandbox":..}]
     Tasks writing to the same files must not run in parallel."""
     from concurrent.futures import ThreadPoolExecutor
-    raw = sys.stdin.read() if a.file == "-" else open(a.file).read()
+    raw = sys.stdin.read() if a.file == "-" else Path(a.file).read_text()
     tasks = json.loads(raw)
     s = load()
 
+    if not isinstance(tasks, list) or not tasks:
+        sys.exit("parallel expects a nonempty JSON task list")
+    configs = []
+    for task in tasks:
+        ns = argparse.Namespace(**{k: task.get(k) for k in ("role", "model", "effort", "sandbox", "profile", "timeout")})
+        cfg = resolve(ns, s)
+        validate_model(cfg, task.get("cd"))
+        configs.append(cfg)
+    workers = validate("max_parallel", a.max if a.max is not None else s["max_parallel"])
+
     def one(i_t):
         i, t = i_t
-        ns = argparse.Namespace(**{k: t.get(k) for k in ("role", "model", "effort", "sandbox", "profile")},
-                                timeout=t.get("timeout"))
-        cfg = resolve(ns, s)
+        cfg = configs[i]
         r = exec_codex(cfg, t["prompt"], t.get("cd"), t.get("add_dir"), kind="task")
         finish_run(r)
         return t.get("name") or f"task{i+1}", t.get("role"), r
 
-    with ThreadPoolExecutor(max_workers=min(a.max, len(tasks))) as ex:
+    with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as ex:
         results = list(ex.map(one, enumerate(tasks)))
     failed = 0
     for name, role, r in results:
@@ -671,7 +1294,22 @@ def cmd_roles(_):
               f"model={r.get('model','(default)')}  {r.get('preamble','')[:70]}")
 
 
+def refresh_bridge_link():
+    target = os.path.realpath(__file__)
+    directory = os.path.join(BRIDGE_HOME, "bin")
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".link-")
+    os.close(fd)
+    os.unlink(tmp)
+    try:
+        os.symlink(target, tmp)
+        os.replace(tmp, os.path.join(directory, "codex_bridge.py"))
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def main():
+    refresh_bridge_link()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("run", "resume"):
@@ -689,22 +1327,28 @@ def main():
     c = sub.add_parser("config")
     c.add_argument("action", nargs="?", default="show", choices=["show", "set", "reset"])
     c.add_argument("pairs", nargs="*")
-    sub.add_parser("models"); sub.add_parser("status"); sub.add_parser("roles")
+    sub.add_parser("models"); sub.add_parser("roles")
+    status = sub.add_parser("status")
+    status.add_argument("job", nargs="?", default="last"); status.add_argument("--name")
+    status.add_argument("--json", action="store_true")
     rv = sub.add_parser("review"); rv.add_argument("focus", nargs="*")
     g = rv.add_mutually_exclusive_group(); g.add_argument("--base"); g.add_argument("--commit")
     rv.add_argument("--adversarial", action="store_true"); rv.add_argument("--background", action="store_true")
     for x in ("model", "effort", "cd", "timeout", "profile"):
         rv.add_argument("--" + x, type=int if x == "timeout" else None)
-    jb = sub.add_parser("jobs"); jb.add_argument("--limit", type=int, default=15)
+    jb = sub.add_parser("jobs"); jb.add_argument("--limit", type=int, default=15); jb.add_argument("--name"); jb.add_argument("--json", action="store_true")
     for n in ("watch", "log", "attach"):
-        q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last")
-        if n == "log": q.add_argument("--full", action="store_true")
+        q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
+        if n == "log":
+            q.add_argument("--full", action="store_true")
+            q.add_argument("--since", type=int, default=0); q.add_argument("--tail", type=int)
+        if n == "attach": q.add_argument("--force", action="store_true")
     for n in ("result", "cancel", "wait"):
-        q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last")
+        q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
         if n == "wait": q.add_argument("--timeout", type=int, default=600)
     sub.add_parser("_job").add_argument("jid")
     pl = sub.add_parser("parallel"); pl.add_argument("file", help="JSON task list file or -")
-    pl.add_argument("--max", type=int, default=4)
+    pl.add_argument("--max", type=int)
     a = ap.parse_args()
     {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "parallel": cmd_parallel,
         "review": cmd_review, "watch": cmd_watch, "log": cmd_log, "attach": cmd_attach, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "_job": cmd__job}.get(
