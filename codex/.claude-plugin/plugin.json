@@ -1,6 +1,6 @@
 {
   "name": "codex",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Claude as the brain, local Codex CLI as the executor. Configurable model / reasoning effort / sandbox (default gpt-6.1-sol, medium).",
   "author": { "name": "local" }
 }
