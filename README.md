@@ -1,6 +1,6 @@
 # Codex Bridge (Claude Code plugin)
 
-Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `medium`, sandbox `workspace-write`.
+Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `medium`, sandbox `danger-full-access` (full permission, never asks).
 
 ## Install
 ```

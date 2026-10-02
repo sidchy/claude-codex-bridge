@@ -24,8 +24,8 @@ Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`
 | Situation | Role | Defaults |
 |---|---|---|
 | Find code / gather facts / map a repo | `explorer` | read-only, low |
-| Implement a well-specified change, bulk edits, scripts | `worker` | workspace-write, medium |
-| Failing test / bug with unknown cause | `debugger` | workspace-write, high |
+| Implement a well-specified change, bulk edits, scripts | `worker` | full-access, medium |
+| Failing test / bug with unknown cause | `debugger` | full-access, high |
 | Second opinion on a diff, audit | `reviewer` | read-only, high |
 | Design / trade-off analysis before coding | `architect` | read-only, xhigh |
 
@@ -51,11 +51,11 @@ Reply with: <files changed + check result, <=10 lines>
 ```
 
 ## Settings
-Defaults persist in `~/.claude/codex-bridge/settings.json` (initially `gpt-6.1-sol`, effort `medium`, sandbox `workspace-write`).
+Defaults persist in `~/.claude/codex-bridge/settings.json` (initially `gpt-6.1-sol`, effort `medium`, sandbox `danger-full-access`: Codex acts without asking).
 - Persistent: `config set model=gpt-5.6-terra effort=high` · `config show` · `config reset` · `models`
 - One-off per call: `--role --model --effort --sandbox --cd --add-dir --timeout`
 - Effort guide: low = trivial edits; medium = default; high/xhigh = tricky debugging or design-heavy changes. Check `models` for what each model supports.
-- Sandbox: `read-only` for analysis/review; `workspace-write` for edits; `danger-full-access` only on explicit user request.
+- Sandbox: `read-only` for analysis/review; `danger-full-access` is the default (user opted in: Codex acts without confirmation); use `workspace-write` or `read-only` per call when the task should be constrained.
 
 ## Don't
 - Don't delegate trivial one-liners or things needing this conversation's context.

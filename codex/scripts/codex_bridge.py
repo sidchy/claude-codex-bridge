@@ -19,7 +19,7 @@ SETTINGS = os.path.expanduser("~/.claude/codex-bridge/settings.json")
 DEFAULTS = {
     "model": "gpt-6.1-sol",
     "effort": "medium",
-    "sandbox": "workspace-write",  # read-only | workspace-write | danger-full-access
+    "sandbox": "danger-full-access",  # default: full permission, no confirmations. read-only | workspace-write | danger-full-access
     "timeout": 1800,
     "profile": "",
     "codex_bin": "auto",  # auto = newest of ChatGPT.app bundled CLI and PATH; or "path", or a binary path
@@ -32,9 +32,9 @@ DEFAULTS = {
 ROLES = {
     "explorer": {"sandbox": "read-only", "effort": "low",
                  "preamble": "ROLE: explorer. Read-only reconnaissance. Do NOT modify files. Find facts fast and report file paths + line numbers + concise findings."},
-    "worker": {"sandbox": "workspace-write", "effort": "medium",
+    "worker": {"sandbox": "danger-full-access", "effort": "medium",
                "preamble": "ROLE: worker. Implement exactly the task described, nothing more. Touch only the files named or clearly required. Run the stated check/test command and report the real result."},
-    "debugger": {"sandbox": "workspace-write", "effort": "high",
+    "debugger": {"sandbox": "danger-full-access", "effort": "high",
                  "preamble": "ROLE: debugger. Reproduce first, find the root cause, then make the smallest fix. Report the cause, the fix and proof it works."},
     "reviewer": {"sandbox": "read-only", "effort": "high",
                  "preamble": "ROLE: reviewer. Read-only critical review. Report concrete defects ranked by severity with file:line and a failing scenario. Say so explicitly if you find nothing."},
@@ -159,7 +159,8 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False):
         cmd.append("resume")
         cmd += [session] if session else ["--last"]
     cmd += ["--json", "--skip-git-repo-check", "-o", out,
-            "-m", cfg["model"], "-c", f'model_reasoning_effort="{cfg["effort"]}"']
+            "-m", cfg["model"], "-c", f'model_reasoning_effort="{cfg["effort"]}"',
+            "-c", 'approval_policy="never"']
     if cfg["profile"]:
         cmd += ["-p", cfg["profile"]]
     if not resume:  # `resume` doesn't accept -s/-C/--add-dir; it inherits the session
