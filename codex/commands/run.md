@@ -1,6 +1,6 @@
 ---
-description: Delegate a task to the local Codex CLI (Claude plans, Codex executes)
-argument-hint: [--model M] [--effort E] [--sandbox S] <task>
+description: Hand a task to Codex (role, model, effort, --background all optional; Claude picks sensible ones)
+argument-hint: [--role R] [--model M] [--effort E] [--sandbox S] [--background] <task>
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*)
 ---
 

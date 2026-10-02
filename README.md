@@ -13,10 +13,13 @@ Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `me
 - `/codex:run <task>` — delegate a task
 - `/codex:config set model=gpt-5.6-terra effort=high` · `/codex:config models` · `/codex:config reset`
 - `/codex:team <goal>` — split into parallel Codex sub-tasks with matched roles (explorer/worker/debugger/reviewer/architect)
-- `/codex:status`
+- `/codex:review [--adversarial] [--base REF]` · `/codex:status` (settings + jobs) · `/codex:result` · `/codex:cancel`
+- `--background` on run/review returns a job id; check with status/result/cancel
 - Or just say "让 codex 去做 …" — the `codex-delegate` skill triggers.
 
 Requires `codex` on PATH and `python3`. Settings: `~/.claude/codex-bridge/settings.json`.
 
 ## Roles & parallel
 `codex_bridge.py roles` lists presets; `run --role worker ...`; `parallel tasks.json` runs a JSON task list concurrently (each task may set its own role/model/effort/sandbox/cd). Agent `codex:codex-runner` relays one task and returns a short report.
+
+This plugin also covers what the official `codex@openai-codex` plugin does (review, adversarial review, background jobs), so that one can be disabled.

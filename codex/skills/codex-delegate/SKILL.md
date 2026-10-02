@@ -1,63 +1,43 @@
 ---
 name: codex-delegate
-description: Delegate well-specified execution work (bulk edits, refactors, scripts, test-fix loops, long-running implementation) to the local Codex CLI while Claude plans and verifies. Use when the user says "让codex做/用codex/delegate to codex", or when a task is mechanical, large, or parallelizable.
+description: The single entry point for using the local Codex CLI from Claude. Use it automatically (the user should never have to choose) when the user mentions codex / 让codex做, wants a code review or second opinion, when Claude is stuck on a bug, when work is bulk/mechanical/long-running/parallelizable, or before declaring a significant change finished. Claude plans and verifies; Codex executes, reviews, or investigates.
 ---
 
-# Claude = brain, Codex = hands
+# Claude = brain, Codex = hands & second pair of eyes
 
-Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`
+Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR` below). Defaults: `gpt-6.1-sol`, effort `medium`, **full permission, never asks**. Pick everything yourself; the user shouldn't have to say which mode.
 
-## Workflow
-1. **Plan first.** Understand the task and read what's needed. Decide exactly what Codex should do.
-2. **Write a self-contained prompt** (Codex has no access to this conversation): goal, absolute paths, constraints, acceptance criteria / test command, files that must not change, expected final report format.
-3. **Run** (prompt via stdin avoids quoting problems):
-   ```bash
-   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py run --cd <dir> - <<'PROMPT'
-   ...
-   PROMPT
-   ```
-   Long jobs: use Bash `run_in_background` and keep working. Independent subtasks can run as parallel background calls (use disjoint files).
-4. **Verify**: Codex's final message is a claim, not proof. Check `git diff`, run tests, spot-read output. If wrong, send a follow-up with `resume` (`--session <id>` printed on stderr; default is the most recent session).
-5. Report to the user what changed and what you verified.
+## Route the request (decide silently)
+| Situation | Do |
+|---|---|
+| "review my changes / check this" | `BR review` (native reviewer; target auto: uncommitted, or `--base main`, `--commit SHA`) |
+| High-stakes, design-heavy, security/data/migration change, or "be tough on it" | `BR review --adversarial "<focus>"` |
+| Finished a significant change yourself | Offer/perform a `review` pass before saying done |
+| Stuck / failing test / unknown root cause / want a 2nd opinion | `BR run --role debugger` (fresh eyes; give it the symptom + what you already tried) |
+| Clear implementation, bulk edits, scripts, refactors | `BR run --role worker` |
+| "Where is X / how does Y work" recon | `BR run --role explorer` |
+| Design/trade-off analysis before coding | `BR run --role architect` |
+| Task will take > ~2 min or is open-ended | add `--background`; keep working; later `BR jobs`, `BR wait [id]`, `BR result [id]`, `BR cancel [id]` |
+| Several independent pieces (disjoint files) | `BR parallel` (JSON list; per-task role/model/effort) or `/codex:team`; sequence dependent steps explorer → worker → reviewer |
+| Follow-up on earlier Codex work ("continue", "dig deeper", fix its findings) | `BR resume [--session ID] "<msg>"` (default: most recent) |
+| Trivial one-liner or needs this conversation's context | Do it yourself; don't delegate |
 
-## Team mode: match the role to the job
-| Situation | Role | Defaults |
-|---|---|---|
-| Find code / gather facts / map a repo | `explorer` | read-only, low |
-| Implement a well-specified change, bulk edits, scripts | `worker` | full-access, medium |
-| Failing test / bug with unknown cause | `debugger` | full-access, high |
-| Second opinion on a diff, audit | `reviewer` | read-only, high |
-| Design / trade-off analysis before coding | `architect` | read-only, xhigh |
+Model/effort: leave defaults unless the job warrants more: `--effort high|xhigh` for tricky debugging/design/adversarial review, `--effort low` for recon. Switch model with `--model gpt-5.6-terra` etc. (`BR models` lists them); persist with `BR config set model=.. effort=..`. Sandbox: default full access; use `--sandbox read-only` if a task must not change files (explorer/reviewer/architect already are).
 
-`codex_bridge.py run --role worker ...` (flags `--model/--effort/--sandbox` still override the role). List with `roles`; add/override roles in settings (`"roles": {"name": {"sandbox":..,"effort":..,"model":..,"preamble":..}}`).
-
-**Parallel**: independent sub-tasks with disjoint files go in one call:
-```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py parallel - <<'JSON'
-[{"name":"scan","role":"explorer","prompt":"..."},
- {"name":"fix-a","role":"worker","cd":"/abs/dir","prompt":"..."},
- {"name":"audit","role":"reviewer","model":"gpt-5.6-terra","prompt":"..."}]
-JSON
-```
-Or spawn `codex-runner` agents (keeps Codex output out of your context). Sequence dependent steps: explorer → worker → reviewer. Codex's own `multi_agent` feature is enabled, so for one big job you may also tell a worker "you may spawn sub-agents for independent parts".
-
-## Hand-off prompt template (keep it tight)
+## Hand-off prompt (Codex can't see this chat; keep it tight)
 ```
 Goal: <one sentence>
-Context: <paths, relevant facts you already found — don't make Codex rediscover them>
-Do: <steps / constraints>   Don't touch: <paths>
-Done when: <test/command that must pass>
+Context: <paths + facts you already found — don't make Codex rediscover>
+Do: <steps/constraints>   Don't touch: <paths>
+Done when: <command that must pass>
 Reply with: <files changed + check result, <=10 lines>
 ```
+Run with the prompt on stdin: `BR run --role worker --cd <dir> - <<'PROMPT' ... PROMPT`. For output you don't want in your context, use the `codex-runner` agent (it relays one task and returns a short report; one per parallel task).
 
-## Settings
-Defaults persist in `~/.claude/codex-bridge/settings.json` (initially `gpt-6.1-sol`, effort `medium`, sandbox `danger-full-access`: Codex acts without asking).
-- Persistent: `config set model=gpt-5.6-terra effort=high` · `config show` · `config reset` · `models`
-- One-off per call: `--role --model --effort --sandbox --cd --add-dir --timeout`
-- Effort guide: low = trivial edits; medium = default; high/xhigh = tricky debugging or design-heavy changes. Check `models` for what each model supports.
-- Sandbox: `read-only` for analysis/review; `danger-full-access` is the default (user opted in: Codex acts without confirmation); use `workspace-write` or `read-only` per call when the task should be constrained.
+## After Codex returns
+Its message is a claim, not proof: check `git diff`, re-run the tests yourself (seen in testing: Codex said pytest crashed; it passed when Claude re-ran it). If wrong, `resume` with specifics. Report to the user: what changed, what you verified, what's open.
 
-## Don't
-- Don't delegate trivial one-liners or things needing this conversation's context.
-- Don't let two Codex runs write the same files concurrently.
-- Don't trust "done" without checking. (Seen in testing: Codex reported pytest crashed inside its sandbox, yet the tests passed when Claude re-ran them.)
+## Rules
+- Two Codex runs must never write the same files concurrently.
+- Codex's own multi-agent is on: for one big job you may tell a worker "you may spawn sub-agents for independent parts".
+- Review findings: confirm the important ones against the code before acting; label unconfirmed ones.

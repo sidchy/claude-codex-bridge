@@ -5,6 +5,8 @@ Subcommands:
   run     [flags] [PROMPT|-]   run a task via `codex exec` (prompt from arg or stdin)
   resume  [flags] [PROMPT|-]   continue the last (or --session ID) Codex session
   config  [show|set k=v ...|reset]   persistent defaults
+  review [--base B|--commit S] [--adversarial] [focus] [--background]
+  jobs | result [id] | wait [id] | cancel [id]   background job control (run/resume/review --background)
   roles                        list role presets (use with --role)
   parallel FILE|-              run a JSON list of tasks concurrently
   models                       list models/efforts from Codex's local cache
@@ -148,13 +150,15 @@ def resolve(a, s):
     return cfg
 
 
-def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False):
+def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None):
     """Run codex once. Returns dict(ok, text, thread, error, usage, cfg)."""
     s = load()
-    if cfg["preamble"]:
+    if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
     out = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
     cmd = [codex_bin(), "exec"]
+    if review is not None:  # native reviewer: target flags only (cannot combine with a prompt)
+        cmd.append("review")
     if resume:
         cmd.append("resume")
         cmd += [session] if session else ["--last"]
@@ -163,14 +167,17 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False):
             "-c", 'approval_policy="never"']
     if cfg["profile"]:
         cmd += ["-p", cfg["profile"]]
-    if not resume:  # `resume` doesn't accept -s/-C/--add-dir; it inherits the session
+    if review is not None:
+        cmd += review
+    elif not resume:  # `resume` doesn't accept -s/-C/--add-dir; it inherits the session
         cmd += ["-s", cfg["sandbox"], "-C", os.path.abspath(cd or os.getcwd())]
         for d in add_dir or []:
             cmd += ["--add-dir", d]
-    cmd += s["extra_args"] + ["-"]
+    cmd += s["extra_args"] + (["-"] if review is None else [])
     res = {"ok": False, "text": "", "thread": None, "error": "", "usage": None, "cfg": cfg}
     try:
-        p = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=cfg["timeout"])
+        p = subprocess.run(cmd, input=prompt or "", capture_output=True, text=True,
+                           timeout=cfg["timeout"], cwd=os.path.abspath(cd or os.getcwd()))
     except subprocess.TimeoutExpired:
         res["error"] = f"codex timed out after {cfg['timeout']}s"
         return res
@@ -218,12 +225,177 @@ def run_codex(a, resume):
     if not prompt.strip():
         sys.exit("empty prompt")
     print(header(cfg, getattr(a, "role", None)) + (" (session inherited)" if resume else ""), file=sys.stderr)
+    if a.background:
+        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, getattr(a, "session", None))
     r = exec_codex(cfg, prompt, a.cd, a.add_dir, getattr(a, "session", None), resume)
     if not r["ok"]:
         sys.exit(f"CODEX FAILED: {r['error']}")
     print(r["text"])
     print(f"\n---\n[codex session={r['thread']} tokens={r['usage']}] follow up: "
           f"codex_bridge.py resume --session {r['thread']} \"<msg>\"", file=sys.stderr)
+
+
+JOBS = os.path.expanduser("~/.claude/codex-bridge/jobs")
+ADVERSARIAL = ("You are performing an ADVERSARIAL review. Your job is to break confidence in the change, not to "
+               "validate it: assume it can fail in subtle, costly ways. Hunt for auth/trust-boundary gaps, data loss, "
+               "rollback/retry/idempotency holes, races, empty/null/timeout behaviour, version/schema drift, and "
+               "observability gaps. Challenge the approach and design choices too, not only defects. Report only "
+               "material findings, ranked by severity, each with file:line, a concrete failure scenario and a fix. "
+               "No style nits. If nothing material survives, say so. Do not modify any files.\n\n")
+
+
+def _job_path(jid, name):
+    return os.path.join(JOBS, jid, name)
+
+
+def _jwrite(jid, **kw):
+    path = _job_path(jid, "state.json")
+    st = {}
+    try:
+        st = json.load(open(path))
+    except (OSError, ValueError):
+        pass
+    st.update(kw)
+    json.dump(st, open(path, "w"), ensure_ascii=False)
+
+
+def _jread(jid):
+    try:
+        return json.load(open(_job_path(jid, "state.json")))
+    except (OSError, ValueError):
+        return None
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None):
+    import time, uuid
+    jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
+    os.makedirs(os.path.join(JOBS, jid))
+    json.dump({"cfg": cfg, "prompt": prompt, "cd": os.path.abspath(cd or os.getcwd()), "add_dir": add_dir,
+               "resume": resume, "session": session, "review": review},
+              open(_job_path(jid, "spec.json"), "w"), ensure_ascii=False)
+    _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.abspath(cd or os.getcwd()),
+            model=cfg["model"], effort=cfg["effort"], started=time.time(),
+            title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
+    log = open(_job_path(jid, "log.txt"), "w")
+    pr = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_job", jid],
+                          stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    _jwrite(jid, pid=pr.pid)
+    print(f"started background job {jid} ({kind}, {cfg['model']} {cfg['effort']}). "
+          f"Check: codex_bridge.py jobs | result {jid} | wait {jid} | cancel {jid}")
+
+
+def cmd__job(a):
+    import time
+    jid = a.jid
+    spec = json.load(open(_job_path(jid, "spec.json")))
+    r = exec_codex(spec["cfg"], spec["prompt"], spec["cd"], spec["add_dir"], spec["session"],
+                   spec["resume"], spec["review"])
+    st = _jread(jid) or {}
+    if st.get("status") == "cancelled":
+        return
+    open(_job_path(jid, "result.txt"), "w").write(r["text"] if r["ok"] else "FAILED: " + r["error"])
+    _jwrite(jid, status="done" if r["ok"] else "failed", thread=r["thread"], usage=r["usage"], finished=time.time())
+
+
+def _resolve_job(ref):
+    if not os.path.isdir(JOBS):
+        sys.exit("no jobs yet")
+    ids = sorted(os.listdir(JOBS))
+    if ref in (None, "last"):
+        if not ids:
+            sys.exit("no jobs yet")
+        return ids[-1]
+    m = [i for i in ids if i == ref or i.endswith(ref)]
+    if len(m) != 1:
+        sys.exit(f"job '{ref}' not found or ambiguous")
+    return m[0]
+
+
+def _refresh(jid):
+    st = _jread(jid) or {}
+    if st.get("status") == "running" and not _alive(st.get("pid")):
+        _jwrite(jid, status="failed", error="worker process died")
+        st = _jread(jid)
+    return st
+
+
+def cmd_jobs(a):
+    import time
+    ids = sorted(os.listdir(JOBS), reverse=True)[:a.limit] if os.path.isdir(JOBS) else []
+    if not ids:
+        print("no jobs"); return
+    print(f"{'ID':<17}{'KIND':<8}{'STATUS':<10}{'AGE':<7}{'MODEL/EFFORT':<22}TASK")
+    for jid in ids:
+        st = _refresh(jid)
+        age = f"{int((time.time()-st.get('started', time.time()))/60)}m"
+        print(f"{jid:<17}{st.get('kind',''):<8}{st.get('status',''):<10}{age:<7}"
+              f"{st.get('model','')+' '+st.get('effort',''):<22}{st.get('title','')}")
+
+
+def cmd_result(a):
+    jid = _resolve_job(a.job); st = _refresh(jid)
+    if st["status"] == "running":
+        print(f"job {jid} still running"); return
+    print(open(_job_path(jid, "result.txt")).read() if os.path.exists(_job_path(jid, "result.txt"))
+          else f"job {jid}: {st['status']} ({st.get('error','no output')})")
+    print(f"\n[job {jid} {st['status']} session={st.get('thread')}]", file=sys.stderr)
+
+
+def cmd_wait(a):
+    import time
+    jid = _resolve_job(a.job); t0 = time.time()
+    while _refresh(jid)["status"] == "running":
+        if time.time() - t0 > a.timeout:
+            print(f"job {jid} still running after {a.timeout}s"); return
+        time.sleep(3)
+    cmd_result(argparse.Namespace(job=jid))
+
+
+def cmd_cancel(a):
+    import signal
+    jid = _resolve_job(a.job); st = _refresh(jid)
+    if st["status"] != "running":
+        print(f"job {jid} is {st['status']}"); return
+    _jwrite(jid, status="cancelled")
+    try:
+        os.killpg(st["pid"], signal.SIGTERM)
+    except OSError:
+        pass
+    print(f"cancelled {jid}")
+
+
+def cmd_review(a):
+    cfg = resolve(a, load())
+    cfg["sandbox"] = "read-only"
+    focus = " ".join(a.focus).strip()
+    if a.commit:
+        target, tflags, desc = "the changes introduced by commit " + a.commit, ["--commit", a.commit], f"`git show {a.commit}`"
+    elif a.base:
+        target, tflags, desc = f"the branch diff against {a.base}", ["--base", a.base], f"`git diff {a.base}...HEAD`"
+    else:
+        target, tflags, desc = "all uncommitted changes (staged, unstaged, untracked)", ["--uncommitted"], \
+            "`git status`, `git diff HEAD`, and the contents of untracked files"
+    if a.adversarial or focus:  # native reviewer can't take a prompt -> drive it as a read-only exec
+        prompt = (ADVERSARIAL if a.adversarial else "Review the change critically. Report concrete defects ranked by severity with file:line. Do not modify files.\n\n") \
+            + f"Target: {target}. Inspect it with {desc}.\nFocus: {focus or '(none; cover everything material)'}"
+        review = None
+    else:
+        prompt, review = None, tflags
+    print(header(cfg, "reviewer") + f" target={target}", file=sys.stderr)
+    if a.background:
+        return start_job("review", cfg, prompt, a.cd, review=review)
+    r = exec_codex(cfg, prompt, a.cd, review=review)
+    if not r["ok"]:
+        sys.exit(f"CODEX FAILED: {r['error']}")
+    print(r["text"])
 
 
 def cmd_parallel(a):
@@ -270,16 +442,28 @@ def main():
         r.add_argument("--role", help="explorer|worker|debugger|reviewer|architect|custom")
         r.add_argument("--cd"); r.add_argument("--add-dir", action="append")
         r.add_argument("--timeout", type=int); r.add_argument("--profile")
+        r.add_argument("--background", action="store_true", help="return a job id immediately")
         if name == "resume":
             r.add_argument("--session", help="session id; default: most recent")
     c = sub.add_parser("config")
     c.add_argument("action", nargs="?", default="show", choices=["show", "set", "reset"])
     c.add_argument("pairs", nargs="*")
     sub.add_parser("models"); sub.add_parser("status"); sub.add_parser("roles")
+    rv = sub.add_parser("review"); rv.add_argument("focus", nargs="*")
+    g = rv.add_mutually_exclusive_group(); g.add_argument("--base"); g.add_argument("--commit")
+    rv.add_argument("--adversarial", action="store_true"); rv.add_argument("--background", action="store_true")
+    for x in ("model", "effort", "cd", "timeout", "profile"):
+        rv.add_argument("--" + x, type=int if x == "timeout" else None)
+    jb = sub.add_parser("jobs"); jb.add_argument("--limit", type=int, default=15)
+    for n in ("result", "cancel", "wait"):
+        q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last")
+        if n == "wait": q.add_argument("--timeout", type=int, default=600)
+    sub.add_parser("_job").add_argument("jid")
     pl = sub.add_parser("parallel"); pl.add_argument("file", help="JSON task list file or -")
     pl.add_argument("--max", type=int, default=4)
     a = ap.parse_args()
-    {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "parallel": cmd_parallel}.get(
+    {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "parallel": cmd_parallel,
+        "review": cmd_review, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "_job": cmd__job}.get(
         a.cmd, lambda x: run_codex(x, a.cmd == "resume"))(a)
 
 
