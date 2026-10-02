@@ -491,15 +491,23 @@ def _stream(jid, follow, full=False):
             line = f.readline()
             if line:
                 try:
-                    for ln in render_event(json.loads(line), full):
+                    ev = json.loads(line)
+                    for ln in render_event(ev, full):
                         print(ln, flush=True)
+                    if ev.get("type") in ("turn.completed", "turn.failed"):
+                        break  # the turn is over; don't wait for codex's slow shutdown
                 except ValueError:
                     pass
                 continue
             if not follow or _refresh(jid).get("status") != "running":
                 break
             time.sleep(0.5)
-    st = _refresh(jid)
+    import time
+    for _ in range(40):  # let the job record its final status/digest
+        st = _refresh(jid)
+        if st.get("status") != "running" or not follow:
+            break
+        time.sleep(0.5)
     print(f"═ {st.get('status')} · {st.get('digest','')}", flush=True)
 
 
