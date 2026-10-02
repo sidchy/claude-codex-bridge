@@ -18,21 +18,24 @@ Script: `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` (call it `BR`). Run it b
 - Follow-up on the same work ("continue", "also…", fix its findings, same files/goal) → `BR run --continue "<short follow-up>"`: reuses the SAME Codex session of this directory, so Codex keeps its context and you only send the delta. Unrelated task, or reviews/second opinions that need fresh eyes → plain `run` (new session). Never start a new session for a follow-up.
 - **Very simple task → do it yourself, don't delegate.** Delegating costs more Claude tokens than it saves (command text, hand-off prompt, verification, report) plus ~15s+ Codex startup. Simple = most of: touches ≤2 files / ≤~15 changed lines, no test-fix loop, answerable in about a minute, a lookup or quick explanation, or depends on this chat's context. Do it directly, then say in one line that it was small enough to do yourself ("这个很小，我直接做了，没转给 Codex") and that they can force Codex by saying "强制用 codex". If the user already said to use Codex (or "强制 codex"), delegate regardless. Delegate when work is big (many files, long reading, test/fix loops), slow, parallelizable, or wants an independent second opinion.
 
-## 2. Effort: default medium, escalate only when warranted
-Model and sandbox: use the saved defaults (`BR config`: gpt-6.1-sol, full permission); pass `--model/--sandbox` only if the user named them.
-Effort follows the saved default (medium) and about 80% of tasks should stay there. Pick per task with `--effort`:
-- **medium (default)**: clear spec, edits/refactors, recon, explanations, standard reviews, doc/data revisions that follow explicit instructions.
-- **high**: root cause unknown, or a medium attempt failed your verification; subtle logic across modules; data-integrity, migration or security-sensitive changes; `--adversarial` reviews; ambiguous or conflicting requirements.
-- **xhigh**: only after high failed, or genuinely intricate work (concurrency, algorithm design, major architecture decisions). Rare and slow: say so.
-- Never go below medium unless the user asks. If the user names an effort, that wins.
-Escalation ladder: if verification fails or Codex reports it is stuck → `BR run --continue --effort high "<what failed and why>"` (same session, keeps context) → if still failing, `--effort xhigh` → then stop and report to the user (max 2 escalations).
-Always tell the user which effort was used and why when it is not medium (e.g. "这次用了 high：第一次 medium 没通过测试").
+## 2. Model & effort: assess difficulty FIRST, choose once, lock for the session
+Before the first call, judge the task (kind + difficulty) and pick ONE model/effort pair. Defaults live in `BR config` (lead gpt-6.1-sol, reasoning gpt-6-astra, bulk gpt-6-luna). Pass `--model/--effort` only when your choice differs from the role's default, or the user named one (the user always wins).
+| Task | Model / effort |
+|---|---|
+| Highly repetitive, simple, many items (bulk edits, per-file/record transforms, extraction, mechanical checks) | lead stays `gpt-6.1-sol` medium and fans out `gpt-6-luna` sub-agents at high (xhigh if items are subtle); or `BR parallel` with luna tasks |
+| Ordinary build/edit/refactor/recon/explain (most tasks, ~80%) | `gpt-6.1-sol` medium |
+| Needs real intelligence: design, tricky logic, ambiguous/conflicting requirements, data-integrity/migration/security-sensitive, hard root cause | `gpt-6-astra` medium; high if genuinely hard |
+| Review (any) | `gpt-6-astra` high (already the default for `review`); `--adversarial` same or xhigh if very risky |
+| xhigh | rare: only for intricate work (concurrency, algorithms, major architecture); say why |
+Say your pick and reason in ONE line before running (e.g. "难度中等偏上，用 astra medium").
+**Lock rule (prompt cache):** inside one Codex session NEVER change model or effort. `--continue`/`resume` always inherit the session's original pair (the script ignores overrides and warns). Sub-agents the Codex lead spawns are exempt; the lead is told (team policy) which model to give them.
+**If the result fails your verification:** do NOT bump effort with `--continue`. Start a NEW session one tier up (sol medium → astra high → astra xhigh) with a fresh self-contained brief that says what was tried and why it failed (the old session stays untouched). Max 2 escalations, then report to the user and say which tier was used.
 
 ## 3. Supervise (built in, not optional)
 - > ~30s or open-ended → `--background`, then open a live view for the user: `mcp__terminal__run_in_terminal` with `<absolute BR path> watch <id>` (ASCII only, one line, no `cwd`). No terminal tool → poll `BR log <id>` and relay.
 - Narrate in 1–2 plain lines at checkpoints; no raw logs.
 - Big/risky work (many files, delete/rename, migrations, hard to undo, or user wants to see the plan): run `--role architect` first, show the plan, ask approve/adjust (AskUserQuestion), then `worker`. "直接做" skips it.
-- Steering a running job: `BR cancel <id>`, then `BR run --continue "<correction>"`.
+- Steering a running job: `BR cancel <id>`, then `BR run --continue "<correction>"` (same model/effort, inherited).
 
 ## 4. Hand-off prompt (Codex can't see this chat; keep it tight)
 `Goal` (1 sentence) · `Context` (paths + facts you already know) · `Do`/`Don't touch` · `Done when` (command that must pass) · `Reply with` (files changed + check result, ≤10 lines).

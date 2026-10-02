@@ -27,6 +27,11 @@ DEFAULTS = {
     "profile": "",
     "codex_bin": "auto",  # auto = newest of ChatGPT.app bundled CLI and PATH; or "path", or a binary path
     "extra_args": [],
+    "model_reasoning": "gpt-6-astra",  # hard reasoning: architect, escalated debugging, judging quality
+    "model_bulk": "gpt-6-luna",        # highly repetitive simple work (sub-agent fan-out)
+    "review_model": "gpt-6-astra",     # reviews default to this model + effort
+    "review_effort": "high",
+    "team_policy": True,               # tell Codex how/when to spawn sub-agents and with which models
     "roles": {},  # user overrides/additions, merged over ROLES below
 }
 
@@ -71,6 +76,10 @@ def validate(k, v):
         sys.exit(f"sandbox must be one of {sorted(SANDBOXES)}")
     if k == "timeout":
         return int(v)
+    if k == "team_policy":
+        return str(v).lower() in ("1", "true", "yes", "on")
+    if k == "review_effort" and v not in EFFORTS:
+        sys.exit(f"review_effort must be one of {sorted(EFFORTS)}")
     if k == "extra_args":
         return v.split() if isinstance(v, str) else v
     if k not in DEFAULTS:
@@ -118,22 +127,36 @@ def cmd_config(a):
 
 
 def cmd_models(_):
-    p = os.path.expanduser("~/.codex/models_cache.json")
     try:
-        models = json.load(open(p))["models"]
+        out = subprocess.run([codex_bin(), "debug", "models"], capture_output=True, text=True, timeout=30).stdout
+        models = json.loads(out)["models"]
     except Exception as e:
-        sys.exit(f"cannot read {p}: {e} (run `codex` once to populate)")
+        sys.exit(f"cannot read the model catalog via `codex debug models`: {e}")
     for m in models:
         if m.get("visibility") != "list":
             continue
         lv = [r.get("effort") for r in m.get("supported_reasoning_levels", [])]
-        print(f"{m['slug']:<18} default={m.get('default_reasoning_level')}  efforts={','.join(lv)}")
+        print(f"{m['slug']:<16} default={m.get('default_reasoning_level')}  efforts={','.join(lv)}")
 
 
 def cmd_status(_):
     print(subprocess.run([codex_bin(), "--version"], capture_output=True, text=True).stdout.strip())
     print("settings file:", SETTINGS)
     print(json.dumps(load(), indent=2, ensure_ascii=False))
+
+
+def team_policy(s):
+    return (
+        "\n\nTEAM POLICY (you are the lead; sub-agents are OPTIONAL, use them only when work splits into independent "
+        "parts with DISJOINT files/inputs; never for small tasks). Pick the model per sub-agent when you spawn it:\n"
+        f"- Highly repetitive, simple per-item work (bulk edits, per-file/per-record transforms, format conversion, "
+        f"extraction, mechanical checks): spawn several `{s['model_bulk']}` sub-agents in parallel, reasoning effort "
+        f"high (xhigh only if items are subtle), each with its own shard.\n"
+        f"- Work that needs real intelligence (design, tricky logic, hard debugging, judging quality or ambiguity): "
+        f"`{s['model_reasoning']}`, effort medium (high if genuinely hard).\n"
+        f"- Everything else: do it yourself, or `{s['model']}` at medium.\n"
+        "Give each sub-agent a self-contained brief (goal, inputs, output location, done-criteria). You verify their "
+        "output before reporting, and your final reply must list which sub-agents/models/efforts you used.")
 
 
 def resolve(a, s):
@@ -144,10 +167,16 @@ def resolve(a, s):
         if a.role not in roles:
             sys.exit(f"unknown role '{a.role}'. roles: {', '.join(roles)}")
         role = roles[a.role]
-    g = lambda k: getattr(a, k, None) or role.get(k) or s[k]
+    rname = getattr(a, "role", None)
+    # built-in role defaults that come from settings (flags still win over everything)
+    sdef = {"reviewer": {"model": s["review_model"], "effort": s["review_effort"]},
+            "architect": {"model": s["model_reasoning"]}}.get(rname, {})
+    g = lambda k: getattr(a, k, None) or role.get(k) or sdef.get(k) or s[k]
     cfg = {k: g(k) for k in ("model", "effort", "sandbox", "timeout", "profile")}
     validate("effort", cfg["effort"]); validate("sandbox", cfg["sandbox"])
     cfg["preamble"] = role.get("preamble", "")
+    if s.get("team_policy") and rname in ("worker", "debugger", "architect"):
+        cfg["preamble"] += team_policy(s)
     return cfg
 
 
@@ -267,6 +296,8 @@ def render_event(ev, full=False):
         return [f"── turn done · tokens in/out {u.get('input_tokens','?')}/{u.get('output_tokens','?')} ──"]
     if t in ("error", "turn.failed"):
         return ["✘ " + _short(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False), 300)]
+    if t == "item.started" and ty == "collab_tool_call":
+        return []
     if t == "item.started" and ty == "command_execution":
         c = it.get("command", "")
         c = c.split(" -lc ", 1)[-1].strip("'\"") if " -lc " in c else c
@@ -282,6 +313,9 @@ def render_event(ev, full=False):
             if not full and len(o) > 4:
                 lines.append(f"    … (+{len(o)-4} lines)")
             return lines
+        if ty == "collab_tool_call":
+            n = len(it.get("receiver_thread_ids") or [])
+            return [f"🧩 sub-agents: {it.get('tool')} ({n} agent{'s' if n != 1 else ''}) {it.get('status','')}"]
         if ty == "reasoning":
             return ["🧠 " + _short(it.get("text", ""), 200)] if it.get("text") else []
         if ty == "error":
@@ -303,14 +337,19 @@ def print_footer(r):
           f"\n    transcript: {me} log {r['jid']}\n    take over : {me} attach {r['jid']}")
 
 
-def latest_thread(cwd):
-    """Newest Codex session started via this bridge in `cwd` (tasks only, not reviews/parallel)."""
+def find_session(cwd=None, thread=None):
+    """Look up a Codex session recorded by this bridge: newest task/resume session in `cwd`,
+    or the one with id `thread`. Returns the job state (has thread/model/effort) or None."""
     if not os.path.isdir(JOBS):
         return None
     for jid in sorted(os.listdir(JOBS), reverse=True):
         st = _jread(jid) or {}
-        if st.get("cwd") == cwd and st.get("kind") in ("task", "resume") and st.get("thread"):
-            return st["thread"]
+        if not st.get("thread"):
+            continue
+        if thread and st["thread"] == thread:
+            return st
+        if not thread and st.get("cwd") == cwd and st.get("kind") in ("task", "resume"):
+            return st
     return None
 
 
@@ -318,11 +357,21 @@ def run_codex(a, resume):
     cfg = resolve(a, load())
     session = getattr(a, "session", None)
     if getattr(a, "cont", False) or (resume and not session):
-        session = session or latest_thread(os.path.abspath(a.cd or os.getcwd()))
-        if session:
-            resume = True
-        elif resume:
+        st = find_session(thread=session) if session else find_session(cwd=os.path.abspath(a.cd or os.getcwd()))
+        if st:
+            session, resume = st["thread"], True
+            # Never switch model/effort inside a session: it would break the prompt cache.
+            for k in ("model", "effort"):
+                asked = getattr(a, k, None)
+                if asked and asked != st.get(k):
+                    print(f"[codex] ignoring --{k} {asked}: this session runs {st.get('model')}/{st.get('effort')} "
+                          f"and is never switched (cache). To change it, start a NEW session with `run`.", file=sys.stderr)
+                cfg[k] = st.get(k, cfg[k])
+        elif resume and not session:
             sys.exit("no earlier Codex session from this bridge in this directory; start with `run`")
+        elif resume:
+            print("[codex] session not recorded by this bridge; resuming with the given model/effort "
+                  "(keep them identical to the original run or the cache is lost)", file=sys.stderr)
         else:
             print("[codex] --continue: no earlier session here, starting a new one", file=sys.stderr)
     prompt = a.prompt
@@ -548,6 +597,7 @@ def cmd_attach(a):
 
 
 def cmd_review(a):
+    a.role = "reviewer"  # review_model/review_effort from settings unless --model/--effort given
     cfg = resolve(a, load())
     cfg["sandbox"] = "read-only"
     focus = " ".join(a.focus).strip()
