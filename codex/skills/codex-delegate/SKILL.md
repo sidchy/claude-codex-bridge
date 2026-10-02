@@ -20,14 +20,44 @@ Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py`
 4. **Verify**: Codex's final message is a claim, not proof. Check `git diff`, run tests, spot-read output. If wrong, send a follow-up with `resume` (`--session <id>` printed on stderr; default is the most recent session).
 5. Report to the user what changed and what you verified.
 
+## Team mode: match the role to the job
+| Situation | Role | Defaults |
+|---|---|---|
+| Find code / gather facts / map a repo | `explorer` | read-only, low |
+| Implement a well-specified change, bulk edits, scripts | `worker` | workspace-write, medium |
+| Failing test / bug with unknown cause | `debugger` | workspace-write, high |
+| Second opinion on a diff, audit | `reviewer` | read-only, high |
+| Design / trade-off analysis before coding | `architect` | read-only, xhigh |
+
+`codex_bridge.py run --role worker ...` (flags `--model/--effort/--sandbox` still override the role). List with `roles`; add/override roles in settings (`"roles": {"name": {"sandbox":..,"effort":..,"model":..,"preamble":..}}`).
+
+**Parallel**: independent sub-tasks with disjoint files go in one call:
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py parallel - <<'JSON'
+[{"name":"scan","role":"explorer","prompt":"..."},
+ {"name":"fix-a","role":"worker","cd":"/abs/dir","prompt":"..."},
+ {"name":"audit","role":"reviewer","model":"gpt-5.6-terra","prompt":"..."}]
+JSON
+```
+Or spawn `codex-runner` agents (keeps Codex output out of your context). Sequence dependent steps: explorer → worker → reviewer. Codex's own `multi_agent` feature is enabled, so for one big job you may also tell a worker "you may spawn sub-agents for independent parts".
+
+## Hand-off prompt template (keep it tight)
+```
+Goal: <one sentence>
+Context: <paths, relevant facts you already found — don't make Codex rediscover them>
+Do: <steps / constraints>   Don't touch: <paths>
+Done when: <test/command that must pass>
+Reply with: <files changed + check result, <=10 lines>
+```
+
 ## Settings
 Defaults persist in `~/.claude/codex-bridge/settings.json` (initially `gpt-6.1-sol`, effort `medium`, sandbox `workspace-write`).
 - Persistent: `config set model=gpt-5.6-terra effort=high` · `config show` · `config reset` · `models`
-- One-off per call: `--model --effort --sandbox --cd --add-dir --timeout`
+- One-off per call: `--role --model --effort --sandbox --cd --add-dir --timeout`
 - Effort guide: low = trivial edits; medium = default; high/xhigh = tricky debugging or design-heavy changes. Check `models` for what each model supports.
 - Sandbox: `read-only` for analysis/review; `workspace-write` for edits; `danger-full-access` only on explicit user request.
 
 ## Don't
 - Don't delegate trivial one-liners or things needing this conversation's context.
 - Don't let two Codex runs write the same files concurrently.
-- Don't trust "done" without checking.
+- Don't trust "done" without checking. (Seen in testing: Codex reported pytest crashed inside its sandbox, yet the tests passed when Claude re-ran them.)
