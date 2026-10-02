@@ -150,8 +150,10 @@ def team_policy(s):
         "\n\nTEAM POLICY (you are the lead; sub-agents are OPTIONAL, use them only when work splits into independent "
         "parts with DISJOINT files/inputs; never for small tasks). Pick the model per sub-agent when you spawn it:\n"
         f"- Highly repetitive, simple per-item work (bulk edits, per-file/per-record transforms, format conversion, "
-        f"extraction, mechanical checks): spawn several `{s['model_bulk']}` sub-agents in parallel, reasoning effort "
-        f"high (xhigh only if items are subtle), each with its own shard.\n"
+        f"extraction, mechanical checks): fan out `{s['model_bulk']}` sub-agents, up to 20 running concurrently "
+        f"(it handles high concurrency well), reasoning effort high (xhigh only if items are subtle). Use it when "
+        f"there are roughly 10+ independent items: one sub-agent per item or per small shard, disjoint outputs; for "
+        f"large batches use many shards (up to the 20 concurrent) to cut latency; for fewer items just do the work yourself. Spot-check a sample of their outputs before reporting.\n"
         f"- Work that needs real intelligence (design, tricky logic, hard debugging, judging quality or ambiguity): "
         f"`{s['model_reasoning']}`, effort medium (high if genuinely hard).\n"
         f"- Everything else: do it yourself, or `{s['model']}` at medium.\n"
@@ -189,14 +191,14 @@ def _gitstate(cd):
 
 
 def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None,
-               jid=None, live=False, kind="task"):
+               jid=None, live=False, kind="task", name=None):
     """Run codex once, streaming events to <run>/events.jsonl. Returns dict(ok, text, thread, error,
     usage, cfg, jid, digest). live=True also prints a readable timeline to stderr as it happens."""
     import threading
     s = load()
     cdir = os.path.abspath(cd or os.getcwd())
     if jid is None:
-        jid = new_run(kind, cfg, prompt, cdir, review)
+        jid = new_run(kind, cfg, prompt, cdir, review, name=name)
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
     out = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
@@ -337,7 +339,7 @@ def print_footer(r):
           f"\n    transcript: {me} log {r['jid']}\n    take over : {me} attach {r['jid']}")
 
 
-def find_session(cwd=None, thread=None):
+def find_session(cwd=None, thread=None, name=None):
     """Look up a Codex session recorded by this bridge: newest task/resume session in `cwd`,
     or the one with id `thread`. Returns the job state (has thread/model/effort) or None."""
     if not os.path.isdir(JOBS):
@@ -348,7 +350,9 @@ def find_session(cwd=None, thread=None):
             continue
         if thread and st["thread"] == thread:
             return st
-        if not thread and st.get("cwd") == cwd and st.get("kind") in ("task", "resume"):
+        if name and st.get("name") == name and st.get("cwd") == cwd:
+            return st
+        if not thread and not name and st.get("cwd") == cwd and st.get("kind") in ("task", "resume"):
             return st
     return None
 
@@ -356,8 +360,14 @@ def find_session(cwd=None, thread=None):
 def run_codex(a, resume):
     cfg = resolve(a, load())
     session = getattr(a, "session", None)
+    label = getattr(a, "name", None)
+    cwd_ = os.path.abspath(a.cd or os.getcwd())
+    if label and not session and not resume:  # named session = get-or-create
+        if find_session(cwd=cwd_, name=label):
+            a.cont = True
     if getattr(a, "cont", False) or (resume and not session):
-        st = find_session(thread=session) if session else find_session(cwd=os.path.abspath(a.cd or os.getcwd()))
+        st = (find_session(thread=session) if session else
+              find_session(cwd=cwd_, name=label) if label else find_session(cwd=cwd_))
         if st:
             session, resume = st["thread"], True
             # Never switch model/effort inside a session: it would break the prompt cache.
@@ -381,9 +391,9 @@ def run_codex(a, resume):
         sys.exit("empty prompt")
     print(header(cfg, getattr(a, "role", None)) + (" (session inherited)" if resume else ""), file=sys.stderr)
     if a.background:
-        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, session)
+        return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, session, name=label)
     r = exec_codex(cfg, prompt, a.cd, a.add_dir, session, resume, live=True,
-                   kind="resume" if resume else "task")
+                   kind="resume" if resume else "task", name=label)
     finish_run(r)
     if not r["ok"]:
         sys.exit(f"CODEX FAILED: {r['error']}\n(run {r['jid']}; transcript: codex_bridge.py log {r['jid']})")
@@ -435,14 +445,14 @@ def _alive(pid):
         return False
 
 
-def new_run(kind, cfg, prompt, cd, review=None, spec=None):
+def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
     import time, uuid
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     os.makedirs(os.path.join(JOBS, jid))
     if spec:
         json.dump(spec, open(_job_path(jid, "spec.json"), "w"), ensure_ascii=False)
     _jwrite(jid, id=jid, kind=kind, status="running", cwd=cd, model=cfg["model"], effort=cfg["effort"],
-            started=time.time(), pid=os.getpid(),
+            started=time.time(), pid=os.getpid(), name=name,
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
     return jid
 
@@ -456,9 +466,9 @@ def finish_run(r):
     _jwrite(r["jid"], status="done" if r["ok"] else "failed", usage=r["usage"], finished=time.time())
 
 
-def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None):
+def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None, name=None):
     cd = os.path.abspath(cd or os.getcwd())
-    jid = new_run(kind, cfg, prompt, cd, review,
+    jid = new_run(kind, cfg, prompt, cd, review, name=name,
                   spec={"cfg": cfg, "prompt": prompt, "cd": cd, "add_dir": add_dir,
                         "resume": resume, "session": session, "review": review})
     log = open(_job_path(jid, "log.txt"), "w")
@@ -672,7 +682,8 @@ def main():
         r.add_argument("--cd"); r.add_argument("--add-dir", action="append")
         r.add_argument("--timeout", type=int); r.add_argument("--profile")
         r.add_argument("--background", action="store_true", help="return a job id immediately")
-        r.add_argument("--continue", dest="cont", action="store_true", help="continue this directory's latest Codex session (same context) if any")
+        r.add_argument("--continue", dest="cont", action="store_true", help="continue the latest session in this directory (same context/model/effort)")
+        r.add_argument("--name", help="named session: reuse the session labelled NAME here if it exists (inherits its model/effort), else start a new one and label it")
         if name == "resume":
             r.add_argument("--session", help="session id; default: most recent")
     c = sub.add_parser("config")
