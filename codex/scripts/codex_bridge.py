@@ -156,7 +156,10 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
     out = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
-    cmd = [codex_bin(), "exec"]
+    cmd = [codex_bin()]
+    if cfg["profile"]:  # --profile is a top-level option; exec/review/resume reject it
+        cmd += ["-p", cfg["profile"]]
+    cmd.append("exec")
     if review is not None:  # native reviewer: target flags only (cannot combine with a prompt)
         cmd.append("review")
     if resume:
@@ -165,8 +168,6 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     cmd += ["--json", "--skip-git-repo-check", "-o", out,
             "-m", cfg["model"], "-c", f'model_reasoning_effort="{cfg["effort"]}"',
             "-c", 'approval_policy="never"']
-    if cfg["profile"]:
-        cmd += ["-p", cfg["profile"]]
     if review is not None:
         cmd += review
     elif not resume:  # `resume` doesn't accept -s/-C/--add-dir; it inherits the session
@@ -249,14 +250,19 @@ def _job_path(jid, name):
 
 
 def _jwrite(jid, **kw):
+    import fcntl
     path = _job_path(jid, "state.json")
-    st = {}
-    try:
-        st = json.load(open(path))
-    except (OSError, ValueError):
-        pass
-    st.update(kw)
-    json.dump(st, open(path, "w"), ensure_ascii=False)
+    with open(_job_path(jid, "state.lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)  # serialize read-modify-write across processes
+        st = {}
+        try:
+            st = json.load(open(path))
+        except (OSError, ValueError):
+            pass
+        st.update(kw)
+        tmp = path + ".tmp"
+        json.dump(st, open(tmp, "w"), ensure_ascii=False)
+        os.replace(tmp, path)  # atomic publish: readers never see a partial file
 
 
 def _jread(jid):
