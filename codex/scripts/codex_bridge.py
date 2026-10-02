@@ -6,6 +6,7 @@ Subcommands:
   resume  [flags] [PROMPT|-]   continue the last (or --session ID) Codex session
   config  [show|set k=v ...|reset]   persistent defaults
   review [--base B|--commit S] [--adversarial] [focus] [--background]
+  watch [id] (live timeline) | log [id] [--full] (transcript) | attach [id] (take over interactively)
   jobs | result [id] | wait [id] | cancel [id]   background job control (run/resume/review --background)
   roles                        list role presets (use with --role)
   parallel FILE|-              run a JSON list of tasks concurrently
@@ -150,9 +151,23 @@ def resolve(a, s):
     return cfg
 
 
-def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None):
-    """Run codex once. Returns dict(ok, text, thread, error, usage, cfg)."""
+def _gitstate(cd):
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=cd, capture_output=True, text=True, timeout=20)
+        return set(out.stdout.splitlines()) if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None,
+               jid=None, live=False, kind="task"):
+    """Run codex once, streaming events to <run>/events.jsonl. Returns dict(ok, text, thread, error,
+    usage, cfg, jid, digest). live=True also prints a readable timeline to stderr as it happens."""
+    import threading
     s = load()
+    cdir = os.path.abspath(cd or os.getcwd())
+    if jid is None:
+        jid = new_run(kind, cfg, prompt, cdir, review)
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
     out = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
@@ -171,51 +186,121 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     if review is not None:
         cmd += review
     elif not resume:  # `resume` doesn't accept -s/-C/--add-dir; it inherits the session
-        cmd += ["-s", cfg["sandbox"], "-C", os.path.abspath(cd or os.getcwd())]
+        cmd += ["-s", cfg["sandbox"], "-C", cdir]
         for d in add_dir or []:
             cmd += ["--add-dir", d]
     cmd += s["extra_args"] + (["-"] if review is None else [])
-    res = {"ok": False, "text": "", "thread": None, "error": "", "usage": None, "cfg": cfg}
+    res = {"ok": False, "text": "", "thread": None, "error": "", "usage": None, "cfg": cfg,
+           "jid": jid, "digest": ""}
+    before = _gitstate(cdir)
+    evf = open(_job_path(jid, "events.jsonl"), "a", buffering=1)
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, cwd=cdir)
+    timed_out = []
+    timer = threading.Timer(cfg["timeout"], lambda: (timed_out.append(1), p.kill()))
+    timer.start()
     try:
-        p = subprocess.run(cmd, input=prompt or "", capture_output=True, text=True,
-                           timeout=cfg["timeout"], cwd=os.path.abspath(cd or os.getcwd()))
-    except subprocess.TimeoutExpired:
-        res["error"] = f"codex timed out after {cfg['timeout']}s"
-        return res
-    msgs, errors = [], []
-    for line in p.stdout.splitlines():
+        p.stdin.write(prompt or ""); p.stdin.close()
+    except OSError:
+        pass
+    msgs, errors, cmds, failed = [], [], 0, 0
+    for line in p.stdout:
         try:
             ev = json.loads(line)
         except ValueError:
             continue
+        evf.write(line if line.endswith("\n") else line + "\n")
         t = ev.get("type")
         if t == "thread.started":
             res["thread"] = ev.get("thread_id")
+            _jwrite(jid, thread=res["thread"])
         elif t == "item.completed":
             it = ev.get("item", {})
             if it.get("type") == "agent_message":
                 msgs.append(it.get("text", ""))
             elif it.get("type") == "error":
                 errors.append(it.get("message", ""))
+            elif it.get("type") == "command_execution":
+                cmds += 1; failed += (it.get("exit_code") not in (0, None))
         elif t in ("error", "turn.failed"):
             errors.append(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False))
         elif t == "turn.completed":
             res["usage"] = ev.get("usage")
+        if live:
+            for ln in render_event(ev):
+                print(ln, file=sys.stderr, flush=True)
+    p.wait(); timer.cancel(); evf.close()
     try:
         final = open(out).read().strip()
         os.unlink(out)
     except OSError:
         final = ""
     res["text"] = final or (msgs[-1] if msgs else "")
-    res["ok"] = p.returncode == 0 and bool(res["text"])
+    res["ok"] = p.returncode == 0 and bool(res["text"]) and not timed_out
     if not res["ok"]:
-        res["error"] = "\n".join(errors) or p.stderr[-2000:] or f"exit {p.returncode}"
+        res["error"] = (f"codex timed out after {cfg['timeout']}s" if timed_out
+                        else "\n".join(errors) or f"exit {p.returncode}")
+    after = _gitstate(cdir)
+    changed = sorted(l.strip() for l in (after - before)) if before is not None and after is not None else None
+    u = res["usage"] or {}
+    parts = [f"{cmds} commands" + (f" ({failed} failed)" if failed else "")]
+    if changed is not None:
+        parts.append("files changed: " + (", ".join(changed[:15]) + (" ..." if len(changed) > 15 else "") if changed else "none"))
+    parts.append(f"tokens in/out {u.get('input_tokens', '?')}/{u.get('output_tokens', '?')}")
+    res["digest"] = " · ".join(parts)
+    _jwrite(jid, digest=res["digest"], thread=res["thread"])
     return res
+
+
+def _short(t, n=160):
+    t = " ".join(str(t).split())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def render_event(ev, full=False):
+    """Turn one codex JSONL event into human-readable lines ([] = skip)."""
+    t = ev.get("type"); it = ev.get("item", {}) or {}; ty = it.get("type")
+    if t == "turn.started":
+        return ["── turn started ──"]
+    if t == "turn.completed":
+        u = ev.get("usage", {})
+        return [f"── turn done · tokens in/out {u.get('input_tokens','?')}/{u.get('output_tokens','?')} ──"]
+    if t in ("error", "turn.failed"):
+        return ["✘ " + _short(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False), 300)]
+    if t == "item.started" and ty == "command_execution":
+        c = it.get("command", "")
+        c = c.split(" -lc ", 1)[-1].strip("'\"") if " -lc " in c else c
+        return ["▶ $ " + (c if full else _short(c, 200))]
+    if t == "item.completed":
+        if ty == "agent_message":
+            return ["💬 " + (it.get("text", "").strip() if full else _short(it.get("text", ""), 400))]
+        if ty == "command_execution":
+            lines = [f"  {'✓' if it.get('exit_code') == 0 else '✗'} exit {it.get('exit_code')}"]
+            o = (it.get("aggregated_output") or "").rstrip().splitlines()
+            for l in (o if full else o[:4]):
+                lines.append("    " + _short(l, 200 if not full else 2000))
+            if not full and len(o) > 4:
+                lines.append(f"    … (+{len(o)-4} lines)")
+            return lines
+        if ty == "reasoning":
+            return ["🧠 " + _short(it.get("text", ""), 200)] if it.get("text") else []
+        if ty == "error":
+            m = it.get("message", "")
+            return [] if "ignoring" in m and "configuration setting" in m else ["⚠ " + _short(m, 300)]
+        if ty:
+            return [f"• {ty}: " + _short(json.dumps({k: v for k, v in it.items() if k not in ('id', 'type')}, ensure_ascii=False), 300)]
+    return []
 
 
 def header(cfg, role=None):
     return (f"[codex] role={role or '-'} model={cfg['model']} effort={cfg['effort']} "
             f"sandbox={cfg['sandbox']}")
+
+
+def print_footer(r):
+    me = os.path.abspath(__file__)
+    print(f"\n--- Codex activity: {r['digest']}\n    run {r['jid']} · session {r['thread']}"
+          f"\n    transcript: {me} log {r['jid']}\n    take over : {me} attach {r['jid']}")
 
 
 def run_codex(a, resume):
@@ -228,12 +313,13 @@ def run_codex(a, resume):
     print(header(cfg, getattr(a, "role", None)) + (" (session inherited)" if resume else ""), file=sys.stderr)
     if a.background:
         return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, getattr(a, "session", None))
-    r = exec_codex(cfg, prompt, a.cd, a.add_dir, getattr(a, "session", None), resume)
+    r = exec_codex(cfg, prompt, a.cd, a.add_dir, getattr(a, "session", None), resume, live=True,
+                   kind="resume" if resume else "task")
+    finish_run(r)
     if not r["ok"]:
-        sys.exit(f"CODEX FAILED: {r['error']}")
+        sys.exit(f"CODEX FAILED: {r['error']}\n(run {r['jid']}; transcript: codex_bridge.py log {r['jid']})")
     print(r["text"])
-    print(f"\n---\n[codex session={r['thread']} tokens={r['usage']}] follow up: "
-          f"codex_bridge.py resume --session {r['thread']} \"<msg>\"", file=sys.stderr)
+    print_footer(r)
 
 
 JOBS = os.path.expanduser("~/.claude/codex-bridge/jobs")
@@ -280,35 +366,47 @@ def _alive(pid):
         return False
 
 
-def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None):
+def new_run(kind, cfg, prompt, cd, review=None, spec=None):
     import time, uuid
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     os.makedirs(os.path.join(JOBS, jid))
-    json.dump({"cfg": cfg, "prompt": prompt, "cd": os.path.abspath(cd or os.getcwd()), "add_dir": add_dir,
-               "resume": resume, "session": session, "review": review},
-              open(_job_path(jid, "spec.json"), "w"), ensure_ascii=False)
-    _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.abspath(cd or os.getcwd()),
-            model=cfg["model"], effort=cfg["effort"], started=time.time(),
+    if spec:
+        json.dump(spec, open(_job_path(jid, "spec.json"), "w"), ensure_ascii=False)
+    _jwrite(jid, id=jid, kind=kind, status="running", cwd=cd, model=cfg["model"], effort=cfg["effort"],
+            started=time.time(), pid=os.getpid(),
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
+    return jid
+
+
+def finish_run(r):
+    import time
+    st = _jread(r["jid"]) or {}
+    if st.get("status") == "cancelled":
+        return
+    open(_job_path(r["jid"], "result.txt"), "w").write(r["text"] if r["ok"] else "FAILED: " + r["error"])
+    _jwrite(r["jid"], status="done" if r["ok"] else "failed", usage=r["usage"], finished=time.time())
+
+
+def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, review=None):
+    cd = os.path.abspath(cd or os.getcwd())
+    jid = new_run(kind, cfg, prompt, cd, review,
+                  spec={"cfg": cfg, "prompt": prompt, "cd": cd, "add_dir": add_dir,
+                        "resume": resume, "session": session, "review": review})
     log = open(_job_path(jid, "log.txt"), "w")
     pr = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_job", jid],
                           stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
     _jwrite(jid, pid=pr.pid)
-    print(f"started background job {jid} ({kind}, {cfg['model']} {cfg['effort']}). "
-          f"Check: codex_bridge.py jobs | result {jid} | wait {jid} | cancel {jid}")
+    print(f"started background job {jid} ({kind}, {cfg['model']} {cfg['effort']}).\n"
+          f"  watch live : {os.path.abspath(__file__)} watch {jid}\n"
+          f"  other      : jobs | log {jid} | result {jid} | wait {jid} | cancel {jid} | attach {jid}")
 
 
 def cmd__job(a):
-    import time
     jid = a.jid
     spec = json.load(open(_job_path(jid, "spec.json")))
     r = exec_codex(spec["cfg"], spec["prompt"], spec["cd"], spec["add_dir"], spec["session"],
-                   spec["resume"], spec["review"])
-    st = _jread(jid) or {}
-    if st.get("status") == "cancelled":
-        return
-    open(_job_path(jid, "result.txt"), "w").write(r["text"] if r["ok"] else "FAILED: " + r["error"])
-    _jwrite(jid, status="done" if r["ok"] else "failed", thread=r["thread"], usage=r["usage"], finished=time.time())
+                   spec["resume"], spec["review"], jid=jid)
+    finish_run(r)
 
 
 def _resolve_job(ref):
@@ -378,6 +476,49 @@ def cmd_cancel(a):
     print(f"cancelled {jid}")
 
 
+def _stream(jid, follow, full=False):
+    import time
+    path = _job_path(jid, "events.jsonl")
+    for _ in range(100):  # wait for the log file to appear
+        if os.path.exists(path): break
+        time.sleep(0.2)
+    else:
+        sys.exit(f"no event log for {jid}")
+    st = _jread(jid) or {}
+    print(f"═ codex run {jid} · {st.get('model')} {st.get('effort')} · {st.get('cwd')}\n═ {st.get('title','')}", flush=True)
+    with open(path) as f:
+        while True:
+            line = f.readline()
+            if line:
+                try:
+                    for ln in render_event(json.loads(line), full):
+                        print(ln, flush=True)
+                except ValueError:
+                    pass
+                continue
+            if not follow or _refresh(jid).get("status") != "running":
+                break
+            time.sleep(0.5)
+    st = _refresh(jid)
+    print(f"═ {st.get('status')} · {st.get('digest','')}", flush=True)
+
+
+def cmd_watch(a):
+    _stream(_resolve_job(a.job), follow=True)
+
+
+def cmd_log(a):
+    _stream(_resolve_job(a.job), follow=False, full=a.full)
+
+
+def cmd_attach(a):
+    jid = _resolve_job(a.job); st = _jread(jid) or {}
+    if not st.get("thread"):
+        sys.exit("no codex session id recorded yet for this run")
+    print(f"cd {st['cwd']} && {codex_bin()} resume {st['thread']}")
+    print("# Run the line above in a terminal to continue this exact Codex session interactively (you drive).", file=sys.stderr)
+
+
 def cmd_review(a):
     cfg = resolve(a, load())
     cfg["sandbox"] = "read-only"
@@ -398,10 +539,12 @@ def cmd_review(a):
     print(header(cfg, "reviewer") + f" target={target}", file=sys.stderr)
     if a.background:
         return start_job("review", cfg, prompt, a.cd, review=review)
-    r = exec_codex(cfg, prompt, a.cd, review=review)
+    r = exec_codex(cfg, prompt, a.cd, review=review, live=True, kind="review")
+    finish_run(r)
     if not r["ok"]:
         sys.exit(f"CODEX FAILED: {r['error']}")
     print(r["text"])
+    print_footer(r)
 
 
 def cmd_parallel(a):
@@ -418,7 +561,8 @@ def cmd_parallel(a):
         ns = argparse.Namespace(**{k: t.get(k) for k in ("role", "model", "effort", "sandbox", "profile")},
                                 timeout=t.get("timeout"))
         cfg = resolve(ns, s)
-        r = exec_codex(cfg, t["prompt"], t.get("cd"), t.get("add_dir"))
+        r = exec_codex(cfg, t["prompt"], t.get("cd"), t.get("add_dir"), kind="task")
+        finish_run(r)
         return t.get("name") or f"task{i+1}", t.get("role"), r
 
     with ThreadPoolExecutor(max_workers=min(a.max, len(tasks))) as ex:
@@ -427,6 +571,7 @@ def cmd_parallel(a):
     for name, role, r in results:
         print(f"===== {name} {header(r['cfg'], role)} session={r['thread']} =====")
         print(r["text"] if r["ok"] else f"FAILED: {r['error']}")
+        print(f"  [activity: {r['digest']} · run {r['jid']}]")
         failed += not r["ok"]
     sys.exit(1 if failed else 0)
 
@@ -461,6 +606,9 @@ def main():
     for x in ("model", "effort", "cd", "timeout", "profile"):
         rv.add_argument("--" + x, type=int if x == "timeout" else None)
     jb = sub.add_parser("jobs"); jb.add_argument("--limit", type=int, default=15)
+    for n in ("watch", "log", "attach"):
+        q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last")
+        if n == "log": q.add_argument("--full", action="store_true")
     for n in ("result", "cancel", "wait"):
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last")
         if n == "wait": q.add_argument("--timeout", type=int, default=600)
@@ -469,7 +617,7 @@ def main():
     pl.add_argument("--max", type=int, default=4)
     a = ap.parse_args()
     {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "parallel": cmd_parallel,
-        "review": cmd_review, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "_job": cmd__job}.get(
+        "review": cmd_review, "watch": cmd_watch, "log": cmd_log, "attach": cmd_attach, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "_job": cmd__job}.get(
         a.cmd, lambda x: run_codex(x, a.cmd == "resume"))(a)
 
 

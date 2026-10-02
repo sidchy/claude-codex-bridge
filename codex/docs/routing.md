@@ -38,3 +38,11 @@ Its message is a claim, not proof: check `git diff`, re-run the tests yourself (
 - Two Codex runs must never write the same files concurrently.
 - Codex's own multi-agent is on: for one big job you may tell a worker "you may spawn sub-agents for independent parts".
 - Review findings: confirm the important ones against the code before acting; label unconfirmed ones.
+
+## Visibility & control (the user must always see and steer what Codex does)
+Codex runs are never a black box: every run is logged (`events.jsonl`) and rendered as a readable timeline (Codex's narration, each command with exit code/output, files changed).
+1. **Show the work.** For anything that will take more than ~30s, or any `--background` job: start it in the background, then open a live view for the user. In the desktop app, use the terminal tool (`mcp__terminal__run_in_terminal`, load via ToolSearch if deferred) to run `BR watch <id>` in the user's terminal pane so they watch Codex live. If no terminal tool exists, poll `BR log <id>` and relay new steps in plain language.
+2. **Narrate checkpoints** while it runs (what Codex has done so far, what it is on now) in one or two short lines, not raw logs.
+3. **Final report always includes** the "Codex activity" digest (commands run, files changed, tokens) plus 2-4 bullets of what Codex actually did, then your own verification result. Offer `BR log <id> --full` for the complete transcript.
+4. **Plan first for big or risky work** (many files, deletes/renames, data migrations, anything hard to undo, or the user asked to "see the plan"): run an `architect` pass (read-only), show the plan, and ask the user to approve/adjust (AskUserQuestion) before running `worker`. The user can say "直接做" to skip.
+5. **Hand-over / steering.** Tell the user they can take over: `BR attach <id>` prints `codex resume <session>`; run it in a terminal to drive the same Codex session interactively. To correct a running job: `BR cancel <id>` then `BR resume --session <id> "<correction>"`.
