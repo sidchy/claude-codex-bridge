@@ -4,10 +4,15 @@ Claude plans; the local `codex` CLI executes. Default: `gpt-6.1-sol`, effort `me
 
 ## Install
 ```
-/plugin marketplace add /absolute/path/to/claude-codex-plugin
+/plugin marketplace add sidchy/claude-codex-bridge
 /plugin install codex@codex-bridge
 ```
-(or one-off: `claude --plugin-dir /absolute/path/to/claude-codex-plugin/codex`)
+(or one-off from a local clone: `claude --plugin-dir /absolute/path/to/claude-codex-bridge/codex`)
+
+Requirements: the [Codex CLI](https://github.com/openai/codex) on your PATH (logged in), `python3` (3.9+), macOS or Linux.
+
+## Security note
+By default Codex runs with **`danger-full-access` and approval policy `never`**: it can read/write anywhere your user can and run commands without asking. Read-only roles (explorer / reviewer / architect) stay read-only. Tighten it with `/codex:config set sandbox=workspace-write` (or `read-only`). Only point it at work you are comfortable letting an agent execute unattended.
 
 ## Use
 Only one thing to remember: **`/codex:run <说人话>`**. It does everything: hand off a task, review (add "要狠一点" for adversarial), watch progress ("它在干嘛"), cancel ("停"), replay ("回看过程"), take over ("我来接手"). Empty request = review current changes.
