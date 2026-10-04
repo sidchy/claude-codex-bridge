@@ -17,7 +17,8 @@ Persistent settings: ~/.claude/codex-bridge/settings.json
 Per-call flags override them: --model --effort --sandbox --cd --add-dir --timeout --profile
 """
 import argparse, glob, json, os, shutil, subprocess, sys, tempfile
-import contextlib, fcntl, re, signal, time, hashlib, shlex, selectors
+import contextlib, fcntl, re, signal, time, hashlib, shlex, selectors, math
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import deque
 
@@ -424,33 +425,52 @@ def memory_workspaces():
     path = os.path.join(_codex_home(), "memories", "MEMORY.md")
     found = []
     try:
-        for line in open(path, encoding="utf-8", errors="ignore"):
-            m = re.match(r"\s*applies_to:\s*cwd=([^;]+)", line)
-            if m:
-                for item in m.group(1).split(","):
-                    item = item.strip()
-                    if not item.startswith("/") or "{" in item or "}" in item:  # skip brace patterns / junk
-                        continue
-                    item = os.path.realpath(item)
-                    if item not in found:
-                        found.append(item)
+        with open(path, encoding="utf-8", errors="ignore") as source:
+            for line in source:
+                m = re.match(r"\s*applies_to:\s*cwd=([^;]+)", line)
+                if m:
+                    for item in re.split(r",\s*(?=/)", m.group(1)):
+                        item = item.strip()
+                        if not item.startswith("/") or "{" in item or "}" in item or "\x00" in item:  # skip brace patterns / junk
+                            continue
+                        try:
+                            item = os.path.realpath(item)
+                        except (OSError, ValueError):
+                            continue
+                        if item not in found:
+                            found.append(item)
     except OSError:
         pass
     return found
 
 
 def memory_scope(cdir, known=None):
-    """(mine, others): memory workspaces that belong to `cdir`, and those that do not. A workspace
-    belongs to the run if it is the run's directory, or a git project root containing it (so a git worktree
-    or subfolder inherits its project's memory); broad ancestors such as ~/Downloads never match."""
+    """Bind entries to this Git root (including its main checkout), never an outer repo.
+    Outside Git, only an exact directory match is meaningful."""
     known = memory_workspaces() if known is None else known
+    cdir = os.path.realpath(cdir)
+    root, main = None, None
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cdir,
+                             capture_output=True, text=True, timeout=3, check=True)
+        root = os.path.realpath(top.stdout.strip())
+        common = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=cdir,
+                                capture_output=True, text=True, timeout=3, check=True)
+        common = os.path.realpath(os.path.join(cdir, common.stdout.strip()))
+        if os.path.basename(common) == ".git":
+            main = os.path.dirname(common)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        root, main = None, None
     mine, others = [], []
     for w in known:
-        inside = cdir == w or cdir.startswith(w.rstrip(os.sep) + os.sep)
-        if inside and (cdir == w or os.path.isdir(os.path.join(w, ".git"))):
-            mine.append(w)
-        else:
-            others.append(w)
+        try:
+            w = os.path.realpath(w)
+            inside_root = root and os.path.commonpath([root, w]) == root
+            ancestor = os.path.commonpath([cdir, w]) == w
+            belongs = w == cdir or w in (root, main) or (inside_root and ancestor)
+        except (OSError, ValueError, TypeError):
+            continue
+        (mine if belongs else others).append(w)
     return mine, others
 
 
@@ -479,69 +499,134 @@ def _codex_home():
 
 
 def _quota_from_limits(rl):
-    """Format a rate_limits object from a Codex rollout, e.g. '89% of weekly used, resets 10-10 09:02'."""
-    if not isinstance(rl, dict):
+    """Quota is optional telemetry: malformed fields invalidate the reading, never the run."""
+    def number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError("not a number")
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("invalid number")
+        return value
+
+    try:
+        if not isinstance(rl, dict):
+            return None
+        bits = []
+        for key in ("primary", "secondary"):
+            w = rl.get(key)
+            if w is None:
+                continue
+            if not isinstance(w, dict):
+                return None
+            used = number(w["used_percent"])
+            minutes = number(w["window_minutes"]) if w.get("window_minutes") is not None else None
+            label = {10080: "weekly", 300: "5h", 1440: "daily"}.get(minutes,
+                        f"{minutes:g}min" if minutes else "window")
+            reset = ""
+            if w.get("resets_at") is not None:
+                reset = ", resets " + time.strftime("%m-%d %H:%M", time.localtime(number(w["resets_at"])))
+            bits.append(f"{used:g}% of {label} used{reset}")
+        credits = rl.get("credits")
+        if credits is not None:
+            if not isinstance(credits, dict):
+                return None
+            if credits.get("unlimited") is True:
+                bits.append("credits unlimited")
+            elif credits.get("balance") is not None:
+                balance = number(credits["balance"])
+                bits.append("credits " + f"{balance:,.2f}".rstrip("0").rstrip("."))
+        return "; ".join(bits) or None
+    except (ValueError, TypeError, KeyError, OverflowError, OSError):
         return None
-    bits = []
-    for key in ("primary", "secondary"):
-        w = rl.get(key)
-        if not isinstance(w, dict) or w.get("used_percent") is None:
-            continue
-        minutes = w.get("window_minutes")
-        label = {10080: "weekly", 300: "5h", 1440: "daily"}.get(minutes, f"{minutes}min" if minutes else "window")
-        reset = ""
-        if w.get("resets_at"):
-            reset = ", resets " + time.strftime("%m-%d %H:%M", time.localtime(w["resets_at"]))
-        bits.append(f"{w['used_percent']:g}% of {label} used{reset}")
-    credits = rl.get("credits") or {}
-    if credits.get("has_credits") and credits.get("balance") not in (None, "", "0"):
+
+
+QUOTA_SCAN_LIMIT = 16 * 1024 * 1024
+
+
+def _last_rate_limits(path, chunk_size=262144):
+    """Return (event time, limits) for the last valid reading, scanning backwards.
+    Reaching the scan cap means not found, not that the session has no quota."""
+    def reading(line):
+        if b'"rate_limits"' not in line:
+            return None
         try:
-            bits.append(f"credits {float(credits['balance']):,.0f}")
-        except (TypeError, ValueError):
-            pass
-    return "; ".join(bits) or None
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return None
+            payload = event.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                return None
+            limits = payload.get("rate_limits")
+            if not _quota_from_limits(limits):
+                return None
+            stamp = event.get("timestamp")
+            if not isinstance(stamp, str):
+                return None
+            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp(), limits
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
 
-
-def _last_rate_limits(path, tail=262144):
     try:
         with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - tail))
-            chunk = f.read().decode("utf-8", "ignore")
-    except OSError:
-        return None
-    found = None
-    for line in chunk.splitlines():
-        if '"rate_limits"' not in line:
-            continue
-        try:
-            payload = json.loads(line).get("payload", {})
-        except ValueError:
-            continue
-        if payload.get("type") == "token_count" and payload.get("rate_limits"):
-            found = payload["rate_limits"]
-    return found
-
-
-def read_quota(thread):
-    """Quota as reported by Codex during this run (read from the session rollout, newest reading wins)."""
-    if not thread:
-        return None
-    for path in glob.glob(os.path.join(_codex_home(), "sessions", "*", "*", "*", f"rollout-*{thread}*.jsonl")):
-        return _quota_from_limits(_last_rate_limits(path))
+            pos = f.seek(0, os.SEEK_END)
+            scanned, remainder = 0, b""
+            while pos > 0 and scanned < QUOTA_SCAN_LIMIT:
+                size = min(pos, chunk_size, QUOTA_SCAN_LIMIT - scanned)
+                pos -= size
+                f.seek(pos)
+                lines = (f.read(size) + remainder).split(b"\n")
+                remainder = lines.pop(0)
+                for line in reversed(lines):
+                    found = reading(line)
+                    if found:
+                        return found
+                scanned += size
+            if pos == 0:
+                return reading(remainder)
+    except (OSError, ValueError):
+        pass
     return None
 
 
+def _newest_quota(files):
+    readings = [r for r in (_last_rate_limits(path) for path in files) if r is not None]
+    return max(readings, key=lambda r: r[0]) if readings else None
+
+
+def read_quota(thread):
+    """Quota reported for this thread, selected by event time across matching rollouts."""
+    if not thread:
+        return None
+    reading = _newest_quota(glob.glob(os.path.join(_codex_home(), "sessions", "*", "*", "*", f"rollout-*{thread}*.jsonl")))
+    return _quota_from_limits(reading[1]) if reading else None
+
+
 def cmd_usage(_):
-    files = sorted(glob.glob(os.path.join(_codex_home(), "sessions", "*", "*", "*", "rollout-*.jsonl")),
-                   key=os.path.getmtime, reverse=True)[:25]
-    for path in files:
-        quota = _quota_from_limits(_last_rate_limits(path))
-        if quota:
-            print(f"Codex quota: {quota}  (as of the last Codex run, {time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(path)))})")
-            return
-    print("no quota information found in recent Codex sessions")
+    try:
+        files = sorted(glob.glob(os.path.join(_codex_home(), "sessions", "*", "*", "*", "rollout-*.jsonl")),
+                       key=os.path.getmtime, reverse=True)[:25]
+        reading = _newest_quota(files)
+        if reading:
+            quota = _quota_from_limits(reading[1])
+            if quota:
+                stamp = time.strftime('%m-%d %H:%M', time.localtime(reading[0]))
+                print(f"Codex quota: {quota}  (reading at {stamp})")
+                return
+    except Exception:
+        pass  # Optional telemetry must never break a command.
+    print("quota unavailable: no valid reading found in recent Codex sessions (bounded scan)")
+
+
+def memory_flags(mode, native_review=False):
+    flags = []
+    if mode == "off" or (mode == "scoped" and native_review):
+        flags += ["-c", "memories.use_memories=false"]
+        if mode == "off":
+            flags += ["-c", "memories.generate_memories=false"]
+    return flags
 
 
 def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None,
@@ -558,6 +643,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
     memory = s.get("codex_memory", "scoped")
+    _jwrite(jid, codex_memory=memory, native_review=review is not None)
     if memory == "scoped" and prompt:
         prompt = memory_guard(cdir) + "\n\n" + prompt
     cmd = [codex_bin()]
@@ -574,10 +660,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     cmd += ["--json", "--skip-git-repo-check", "-o", out,
             "-m", cfg["model"], "-c", f'model_reasoning_effort="{cfg["effort"]}"',
             "-c", 'approval_policy="never"']
-    if memory == "off" or (memory == "scoped" and review is not None):  # native review can't take a guard prompt
-        cmd += ["-c", "memories.use_memories=false"]
-        if memory == "off":
-            cmd += ["-c", "memories.generate_memories=false"]
+    cmd += memory_flags(memory, native_review=review is not None)
     if review is not None:
         cmd += ["-c", f'sandbox_mode="{cfg["sandbox"]}"'] + review
     elif resume:
@@ -691,7 +774,10 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     if (before and before["capped"]) or (after and after["capped"]):
         parts.append(f"hash snapshot capped ({HASH_FILE_LIMIT} files / {HASH_BYTE_LIMIT} bytes); touched list incomplete")
     parts.append(f"tokens in/out {u.get('input_tokens', '?')}/{u.get('output_tokens', '?')}")
-    res["quota"] = read_quota(res["thread"])
+    try:
+        res["quota"] = read_quota(res["thread"])
+    except Exception:
+        res["quota"] = None  # Includes parallel tasks: telemetry never changes their results.
     if res["quota"]:
         parts.append("quota: " + res["quota"])
     res["digest"] = " · ".join(parts)
@@ -1173,6 +1259,7 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
         Path(_job_path(jid, "spec.json")).write_text(json.dumps(spec, ensure_ascii=False))
     _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.realpath(cd), model=cfg["model"], effort=cfg["effort"],
             started=time.time(), pid=os.getpid(), pgid=None, name=name, sandbox=cfg["sandbox"], profile=cfg["profile"],
+            codex_memory=load().get("codex_memory", "scoped"), native_review=review is not None,
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
     return jid
 
@@ -1445,6 +1532,10 @@ def cmd_attach(a):
     if sandbox not in SANDBOXES:
         sandbox = load()["sandbox"]
     cmd += ["-c", f'sandbox_mode="{sandbox}"', "-c", 'approval_policy="never"']
+    memory = st.get("codex_memory")
+    if memory is None:
+        memory = load().get("codex_memory", "scoped")
+    cmd += memory_flags(memory, native_review=st.get("native_review", False))
     print(f"cd {shlex.quote(st['cwd'])} && {shlex.join(cmd)}")
     print("# Run the line above in a terminal to continue this exact Codex session interactively (you drive).", file=sys.stderr)
 

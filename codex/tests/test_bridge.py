@@ -776,23 +776,61 @@ class BridgeTests(unittest.TestCase):
         native.mkdir(parents=True, exist_ok=True)
         (native / "MEMORY.md").write_text("".join(f"# Task Group: x\napplies_to: cwd={w}; reuse_rule=x\n" for w in workspaces))
 
-    def test_memory_scope_binds_to_workspace(self):
-        proj = self.root / "proj"; (proj / ".git").mkdir(parents=True)
-        wt = proj / ".claude" / "worktrees" / "feature"; wt.mkdir(parents=True)
-        sibling = self.root / "proj-sibling"; (sibling / ".git").mkdir(parents=True)
-        broad = self.root / "Downloads"; (broad / "new").mkdir(parents=True)
-        self._memory_home(proj, sibling, broad, "/Users/x/{a,b}", "relative/path")
-        known = b.memory_workspaces()
-        self.assertEqual(len(known), 3)  # brace patterns and relative junk are ignored
-        mine, others = b.memory_scope(os.path.realpath(wt), known)
-        self.assertEqual(mine, [os.path.realpath(proj)])  # worktree inherits its project, not the sibling
-        self.assertNotIn(os.path.realpath(proj), others)
-        mine, _ = b.memory_scope(os.path.realpath(broad / "new"), known)
-        self.assertEqual(mine, [])  # a broad ancestor without .git never matches: new workspace = empty memory
-        guard = b.memory_guard(os.path.realpath(wt), known)
-        self.assertIn("Use ONLY those entries", guard)
-        self.assertIn(os.path.realpath(sibling), guard)
-        self.assertIn("new workspace", b.memory_guard(os.path.realpath(broad / "new"), known))
+    def git(self, directory, *args):
+        return subprocess.run(["git", "-C", str(directory)] + list(args), check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def init_repo(self, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        self.git(directory, "init")
+        self.git(directory, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "--allow-empty", "-m", "initial")
+
+    def test_memory_scope_nested_repo_isolation(self):
+        proj = self.root / "proj"
+        nested = proj / "B"
+        self.init_repo(proj)
+        self.init_repo(nested)
+        sub = nested / "sub" / "deep"
+        sub.mkdir(parents=True)
+        known = list(map(os.path.realpath, [self.root, proj, nested, nested / "sub", sub]))
+        mine, others = b.memory_scope(str(sub), known)
+        self.assertEqual(mine, known[2:])
+        self.assertEqual(others, known[:2])
+        self.assertEqual(b.memory_scope(str(nested), known)[0], [os.path.realpath(nested)])
+        self.assertIn("Use ONLY those entries", b.memory_guard(str(sub), known))
+
+    def test_memory_scope_real_worktrees(self):
+        proj = self.root / "proj"
+        self.init_repo(proj)
+        for i, wt in enumerate((proj / ".claude" / "worktrees" / "inside", self.root / "elsewhere" / "outside")):
+            self.git(proj, "worktree", "add", "-b", "feature" + str(i), str(wt))
+            self.assertTrue((wt / ".git").is_file())
+            sub = wt / "sub" / "deep"
+            sub.mkdir(parents=True)
+            known = list(map(os.path.realpath, [self.root, proj, wt, wt / "sub"]))
+            self.assertEqual(b.memory_scope(str(sub), known)[0], known[1:])
+            self.assertEqual(b.memory_scope(str(wt), known)[0], known[1:3])
+        sub = proj / "sub"
+        sub.mkdir()
+        self.assertEqual(b.memory_scope(str(sub), [str(proj)])[0], [os.path.realpath(proj)])
+
+    def test_memory_scope_non_git_and_missing_git(self):
+        sub = self.cwd / "sub"
+        sub.mkdir()
+        known = list(map(os.path.realpath, [self.root, self.cwd, sub]))
+        self.assertEqual(b.memory_scope(str(sub), known)[0], known[2:])
+        self.init_repo(self.cwd)
+        with mock.patch.object(b.subprocess, "run", side_effect=FileNotFoundError("git")):
+            self.assertEqual(b.memory_scope(str(sub), known)[0], known[2:])
+        self.assertIn("new workspace", b.memory_guard(str(self.cwd / "unknown"), []))
+
+    def test_memory_paths_commas_nul_and_braces(self):
+        comma = self.root / "proj,backup"
+        self._memory_home(str(comma) + ", " + str(self.cwd), "/tmp/bad\x00path",
+                          "/tmp/{a,b}", "relative", "/tmp/{a, /tmp/b}")
+        self.assertEqual(b.memory_workspaces(), list(map(os.path.realpath, [comma, self.cwd])))
+        self.assertEqual(b.memory_scope(str(comma))[0], [os.path.realpath(comma)])
 
     def test_memory_modes_change_prompt_and_flags(self):
         capture = self.root / "cap.json"
@@ -823,7 +861,7 @@ class BridgeTests(unittest.TestCase):
         day.mkdir(parents=True)
         limits = {"primary": {"used_percent": 48.0, "window_minutes": 10080, "resets_at": 1791594132}, "secondary": None,
                   "credits": {"has_credits": True, "balance": "62270.44"}}
-        event = {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": limits}}
+        event = {"timestamp": "2026-10-04T00:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": limits}}
         (day / "rollout-2026-10-04T00-00-00-thread-q.jsonl").write_text("noise\n" + json.dumps(event) + "\n")
         text = b.read_quota("thread-q")
         self.assertIn("48% of weekly used, resets", text)
@@ -836,6 +874,105 @@ class BridgeTests(unittest.TestCase):
         self.fake("import json\nprint(json.dumps({'type':'thread.started','thread_id':'thread-q'}))\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))\n")
         r = b.exec_codex(self.cfg(), "go", str(self.cwd))
         self.assertIn("quota: 48% of weekly used", r["digest"])
+
+    def test_attach_preserves_recorded_memory_mode(self):
+        import shlex
+        self.fake("print(json.dumps({'type':'thread.started','thread_id':'memory-thread'}))\n"
+                  "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))")
+        for mode, review in (("off", None), ("scoped", ["--uncommitted"]), ("on", None)):
+            b.save({**b.load(), "codex_memory": mode})
+            r = b.exec_codex(self.cfg(), "go", str(self.cwd), review=review)
+            b.finish_run(r)
+            self.assertEqual(b._jread(r["jid"])["codex_memory"], mode)
+            b.save({**b.load(), "codex_memory": "on"})  # attach must use the recorded mode
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                b.cmd_attach(argparse.Namespace(job=r["jid"], name=None, force=False))
+            argv = shlex.split(out.getvalue())
+            self.assertEqual("memories.use_memories=false" in argv, mode != "on")
+            self.assertEqual("memories.generate_memories=false" in argv, mode == "off")
+            self.assertIn("memory-thread", argv)
+
+    def rollout(self, name, stamp="2026-10-04T00:00:00Z", limits=None):
+        day = Path(self.env["CODEX_HOME"]) / "sessions" / "2026" / "10" / "04"
+        day.mkdir(parents=True, exist_ok=True)
+        path = day / ("rollout-" + name + ".jsonl")
+        event = {"timestamp": stamp, "payload": {"type": "token_count", "rate_limits":
+                 limits if limits is not None else {"primary": {"used_percent": 48}}}}
+        path.write_text(json.dumps(event) + "\n")
+        return path
+
+    def test_quota_malformed_is_best_effort(self):
+        bad = [None, [], {"primary": []}, {"primary": {}}, {"primary": {"used_percent": "junk"}},
+               {"primary": {"used_percent": float("nan")}}, {"primary": {"used_percent": True}},
+               {"primary": {"used_percent": 1, "window_minutes": []}},
+               {"primary": {"used_percent": 1, "resets_at": "junk"}},
+               {"primary": {"used_percent": 1, "resets_at": 1e300}}, {"credits": []},
+               {"credits": {"balance": "junk"}}]
+        for limits in bad:
+            with self.subTest(limits=limits):
+                self.assertIsNone(b._quota_from_limits(limits))
+        self.assertIn("48%", b._quota_from_limits({"primary": {"used_percent": "48", "resets_at": "1791594132"}}))
+        path = self.rollout("malformed", stamp="bad timestamp")
+        with path.open("a") as f:
+            for payload in ([], "text", None):
+                f.write(json.dumps({"payload": payload, "rate_limits": {}}) + "\n")
+            f.write('["rate_limits"]\n')
+        self.assertIsNone(b._last_rate_limits(path))
+        self.fake("print(json.dumps({'type':'thread.started','thread_id':'malformed'}))\n"
+                  "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))")
+        r = b.exec_codex(self.cfg(), "go", str(self.cwd))
+        self.assertTrue(r["ok"])
+        self.assertIsNone(r["quota"])
+        with mock.patch.object(b, "read_quota", side_effect=RuntimeError("broken telemetry")):
+            r = b.exec_codex(self.cfg(), "go", str(self.cwd))
+            self.assertTrue(r["ok"])
+            taskfile = self.root / "tasks.json"
+            taskfile.write_text(json.dumps([{"prompt": "go", "cd": str(self.cwd)}]))
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit_result:
+                b.cmd_parallel(argparse.Namespace(file=str(taskfile), max=None))
+            self.assertEqual(exit_result.exception.code, 0)
+        with mock.patch.object(b, "_last_rate_limits", side_effect=RuntimeError("broken telemetry")), contextlib.redirect_stdout(io.StringIO()) as out:
+            b.cmd_usage(None)
+        self.assertIn("quota unavailable", out.getvalue())
+
+    def test_quota_credit_precision(self):
+        for balance, expected in (("0.44", "0.44"), ("0.9", "0.9"), ("0", "0"), (0, "0"),
+                                  ("62270.44", "62,270.44"), ("1.234", "1.23")):
+            self.assertEqual(b._quota_from_limits({"credits": {"has_credits": False, "balance": balance}}), "credits " + expected)
+        self.assertEqual(b._quota_from_limits({"credits": {"unlimited": True}}), "credits unlimited")
+
+    def test_quota_scans_past_large_tool_output(self):
+        path = self.rollout("large")
+        with path.open("a") as f:
+            f.write(json.dumps({"payload": {"type": "tool_output", "text": "x" * 600000}}) + "\n")
+        reading = b._last_rate_limits(path)
+        self.assertEqual(reading[1]["primary"]["used_percent"], 48)
+        self.assertIn("48%", b.read_quota("large"))
+        with mock.patch.object(b, "QUOTA_SCAN_LIMIT", 262144):
+            self.assertIsNone(b._last_rate_limits(path))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                b.cmd_usage(None)
+            self.assertIn("bounded scan", out.getvalue())
+        # Split records, malformed trailing readings, and a file without a final newline.
+        path.write_text(path.read_text().rstrip("\n") + '\n{"payload": [], "rate_limits": {}}')
+        self.assertIsNotNone(b._last_rate_limits(path, chunk_size=73))
+
+    def test_quota_newest_event_time_not_mtime(self):
+        import time
+        newer = self.rollout("first-thread-q", "2026-10-04T01:02:00Z", {"primary": {"used_percent": 49}})
+        older = self.rollout("second-thread-q", "2026-10-03T01:02:00Z", {"primary": {"used_percent": 12}})
+        os.utime(newer, (100, 100))
+        os.utime(older, (200, 200))
+        for paths in ([str(older), str(newer)], [str(newer), str(older)]):
+            with mock.patch.object(b.glob, "glob", return_value=paths):
+                self.assertIn("49%", b.read_quota("thread-q"))
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    b.cmd_usage(None)
+            self.assertIn("49%", out.getvalue())
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(b._last_rate_limits(newer)[0]))
+            self.assertIn("reading at " + stamp, out.getvalue())
+            self.assertNotIn("12%", out.getvalue())
 
 
 if __name__ == "__main__":
