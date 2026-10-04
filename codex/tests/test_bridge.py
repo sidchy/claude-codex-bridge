@@ -974,6 +974,22 @@ class BridgeTests(unittest.TestCase):
             self.assertIn("reading at " + stamp, out.getvalue())
             self.assertNotIn("12%", out.getvalue())
 
+    def test_background_start_reminds_to_open_live_view(self):
+        self.fake("import json\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))\n")
+        result = subprocess.run([str(SCRIPT), "run", "--background", "--role", "explorer", "--cd", str(self.cwd), "hello"],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("watch live", result.stdout)
+        self.assertIn("reminder", result.stdout)
+        self.assertIn("ToolSearch", result.stdout)
+
+    def test_run_prompt_requires_live_view_and_tool_loading(self):
+        prompt = (SCRIPT.parents[1] / "commands" / "run.md").read_text()
+        self.assertIn("required step", prompt)
+        self.assertIn("select:mcp__terminal__run_in_terminal", prompt)
+        self.assertIn("mcp__terminal__stop_terminal_tab", prompt.split("---", 2)[1])  # allowed-tools frontmatter
+        self.assertIn("ToolSearch", prompt.split("---", 2)[1])
+
 
 if __name__ == "__main__":
     unittest.main()

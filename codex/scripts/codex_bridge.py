@@ -1308,6 +1308,8 @@ def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, r
     for label, command in (("watch live", "watch"), ("transcript", "log"), ("result", "result"),
                            ("wait", "wait"), ("cancel", "cancel"), ("take over", "attach")):
         print(f"  {label:<10}: {bridge_command(command, jid)}")
+    print("  reminder  : open the 'watch live' command in a terminal pane tab now so the user can see Codex work "
+          "(desktop app: mcp__terminal__run_in_terminal, load it with ToolSearch if it is deferred).")
 
 
 

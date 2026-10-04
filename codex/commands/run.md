@@ -1,7 +1,7 @@
 ---
 description: Codex 的唯一入口：交活、审查、看进度、取消、接管，直接说人话，其余全自动
 argument-hint: <说人话：做什么 / 审查 / "它在干嘛" / "停" / "我来接手"；不写则审查当前改动>
-allowed-tools: mcp__terminal__run_in_terminal, Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Bash(~/.claude/codex-bridge/bin/codex_bridge.py:*), Bash(git:*), Bash(python3 -m unittest:*), Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
+allowed-tools: mcp__terminal__run_in_terminal, mcp__terminal__stop_terminal_tab, ToolSearch, Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Bash(~/.claude/codex-bridge/bin/codex_bridge.py:*), Bash(git:*), Bash(python3 -m unittest:*), Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
 disable-model-invocation: true
 ---
 
@@ -41,7 +41,11 @@ Assess difficulty before the first call; state your model/effort and reason in o
 Within one session NEVER switch model or effort (prompt cache); all resume paths inherit the original pair. Lead-spawned sub-agents are exempt and follow the injected team policy. On a reasoning/quality verification failure, start a NEW session with a self-contained brief describing the failure: sol medium → astra high → astra xhigh. Do not escalate permission/network failures. Maximum two escalations, then report the outcome and tier.
 
 ## Supervision and handoff
-- Work taking ~30s+ or open-ended: start `--background`. With `mcp__terminal__run_in_terminal`, open `~/.claude/codex-bridge/bin/codex_bridge.py watch <id>`: one ASCII command line, no cwd. This symlink avoids Chinese/non-ASCII installation paths. For a custom bridge home, copy the printed command including its `CODEX_BRIDGE_HOME=...` prefix; the terminal tool requires an ASCII path.
+- Work taking ~30s+ or open-ended: start `--background`, and in the SAME turn, right after the job id is printed, open the live view for the user. This is a required step, not an option; the user watches Codex work in the desktop app's terminal pane, and skipping it leaves them blind.
+  1. If `mcp__terminal__run_in_terminal` is not callable, it is a deferred tool: load it first with ToolSearch, query `select:mcp__terminal__run_in_terminal`. Never conclude "no terminal tool" without trying this.
+  2. Call it with `command` = the printed `watch` line (normally `~/.claude/codex-bridge/bin/codex_bridge.py watch <id>`; one ASCII line, no `cwd`, `title` = a short label such as "Codex: <task>"). Open one tab per background job, every time, including when an earlier tab exists. With a custom bridge home, use the printed command with its `CODEX_BRIDGE_HOME=...` prefix.
+  3. When the job finishes, close that tab (`mcp__terminal__stop_terminal_tab` with `close: true`) so the pane does not pile up.
+  4. Only if the tool truly does not exist or is denied: say so and give the user the exact `watch` command to run in their own terminal; then relay progress yourself with `log <id> --since`.
 - No terminal tool: poll `log <id> --since 0`, then use each printed next cursor as `--since`; `status <id> --json` gives compact state. `log <id> --tail N` gives bounded history; `--full` expands details. Relay 1–2 plain lines at checkpoints, not raw logs.
 - Progress → watch; replay → log; stop → `cancel <id>` then inspect `git status`; result → `wait <id>` then `result <id>`; takeover → `attach <id>` and give its quoted resume line. Attach refuses active jobs unless `--force`; normally cancel/wait first. Supervision defaults to newest job in this directory, with a printed notice on global fallback; `--name <label>` selects a local label.
 - Corrections: identify the exact job and its label, `cancel <id>`, then `run --name <same-label> "<correction>"`. Never use implicit latest. For an unnamed job, use `resume --session <recorded-thread-id>` after cancellation.
