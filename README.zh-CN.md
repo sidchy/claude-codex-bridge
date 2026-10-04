@@ -77,6 +77,12 @@ Claude 在第一次调用前评估任务，并在整个 Codex 会话里保持这
 
 超过约 30 秒的任务会自动转后台。大改动或有风险的操作（很多文件、删除、数据迁移），Claude 会先让 Codex 以只读方式出方案，给你看并等你确认再动手。说一句"直接做"可以跳过。
 
+## 记忆和额度
+
+Codex 只有一份覆盖所有项目的全局记忆，而且按关键词查找，所以名字、主题相近的项目会互相串。桥接层会把每次运行绑定到它的工作区：明确告诉 Codex 哪些记忆条目属于当前目录（目录本身，或它所在的 git 项目根，所以 worktree 会继承所属项目的记忆），其余一律忽略。全新的工作区一开始记忆是空的，会随着在这里的运行逐渐积累。把 `codex_memory` 设成 `off` 可以完全关闭记忆，设成 `on` 就是 Codex 原生行为。
+
+每份报告末尾都会带上 Codex 自己返回的额度读数，比如 `quota: 48% of weekly used, resets 10-10 09:02`。`usage` 可以查看最新的读数。用量超过 80% 后，Claude 会避免 xhigh 和大规模扇出。
+
 ## 审查
 
 审查用 `gpt-6-astra` high，只读。默认审你未提交的改动，也可以指定和某个分支（比如 main）对比，或某个提交。说"要狠一点"会走对抗式审查，专门挑设计上的毛病，按严重度排序。审查完 Claude 会把重要的发现对照代码核实，告诉你哪些站得住脚。
@@ -95,6 +101,7 @@ Claude 在第一次调用前评估任务，并在整个 Codex 会话里保持这
 | `review_model`、`review_effort` | `gpt-6-astra`、`high` | 审查 |
 | `team_policy` | `true` | 告诉 Codex 主控何时派子代理、每个用什么模型 |
 | `max_parallel` | `4` | `parallel` 的并发数 |
+| `codex_memory` | `scoped` | `scoped` 把 Codex 的全局记忆绑定到本次运行的工作区，`off` 关闭记忆，`on` 是 Codex 原生行为 |
 | `timeout` | `1800` | 每次运行的秒数 |
 | `profile` | 空 | Codex 配置 profile |
 | `codex_bin` | `auto` | 在 ChatGPT 桌面端自带的 CLI 和 `PATH` 里的 CLI 中取较新的 |
@@ -127,7 +134,7 @@ resume --session ID "<消息>"
 review [--base REF | --commit SHA] [--adversarial] [--background] [关注点 ...]
 jobs | status | watch | log [--since N] [--tail N] [--full] | attach | wait | result | cancel   # 可带任务号或 --name
 parallel tasks.json
-roles | models | config [show | set k=v | reset]
+roles | models | usage | config [show | set k=v | reset]
 ```
 
 角色有 `explorer`、`worker`、`debugger`、`reviewer`、`architect`。Claude 如何评估任务、何时升级、何时自己动手，这些行为写在 `codex/commands/run.md` 里。

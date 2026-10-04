@@ -77,6 +77,12 @@ Every run is logged under `~/.claude/codex-bridge/jobs/`.
 
 Jobs longer than about 30 seconds go to the background on their own. For big or risky changes (many files, deletes, migrations), Claude first gets a read-only plan from Codex and asks you before going ahead. Say "just do it" to skip that.
 
+## Memory and quota
+
+Codex keeps one global memory for all your projects and looks things up by keyword, so similar projects can leak into each other. The bridge binds each run to its workspace: it tells Codex which memory entries belong to the run's directory (the directory itself, or its git project root, so worktrees inherit their project) and to ignore all the others. A new workspace starts with empty memory that builds up from runs there. Set `codex_memory` to `off` to disable memory, or `on` for Codex's native behaviour.
+
+Every report ends with the quota reading Codex itself returns, for example `quota: 48% of weekly used, resets 10-10 09:02`. `usage` shows the latest one. Above 80%, Claude avoids xhigh and large fan-outs.
+
 ## Review
 
 Reviews run on `gpt-6-astra` high, read-only. The default target is your uncommitted changes. Ask for a branch (`against main`) or a commit, or say "be tough" for an adversarial pass that goes after the design and ranks findings by severity. Claude then checks the important findings against the code and tells you which ones held up.
@@ -95,6 +101,7 @@ Reviews run on `gpt-6-astra` high, read-only. The default target is your uncommi
 | `review_model`, `review_effort` | `gpt-6-astra`, `high` | reviews |
 | `team_policy` | `true` | tells the Codex lead when to spawn sub-agents and which model to give them |
 | `max_parallel` | `4` | concurrent jobs for `parallel` |
+| `codex_memory` | `scoped` | `scoped` binds Codex's global memory to the run's workspace, `off` disables memory, `on` is Codex's native behaviour |
 | `timeout` | `1800` | seconds per run |
 | `profile` | empty | Codex config profile |
 | `codex_bin` | `auto` | newest of the ChatGPT app's bundled CLI and the one on your `PATH` |
@@ -127,7 +134,7 @@ resume --session ID "<message>"
 review [--base REF | --commit SHA] [--adversarial] [--background] [focus ...]
 jobs | status | watch | log [--since N] [--tail N] [--full] | attach | wait | result | cancel   # optional job id or --name
 parallel tasks.json
-roles | models | config [show | set k=v | reset]
+roles | models | usage | config [show | set k=v | reset]
 ```
 
 Roles are `explorer`, `worker`, `debugger`, `reviewer` and `architect`. The prompt behaviour (how Claude rates tasks, when it escalates, when it does the work itself) lives in `codex/commands/run.md`.

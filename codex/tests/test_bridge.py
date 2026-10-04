@@ -771,6 +771,72 @@ class BridgeTests(unittest.TestCase):
             unrelated.kill()
             unrelated.wait(timeout=2)
 
+    def _memory_home(self, *workspaces):
+        native = Path(self.env["CODEX_HOME"]) / "memories"
+        native.mkdir(parents=True, exist_ok=True)
+        (native / "MEMORY.md").write_text("".join(f"# Task Group: x\napplies_to: cwd={w}; reuse_rule=x\n" for w in workspaces))
+
+    def test_memory_scope_binds_to_workspace(self):
+        proj = self.root / "proj"; (proj / ".git").mkdir(parents=True)
+        wt = proj / ".claude" / "worktrees" / "feature"; wt.mkdir(parents=True)
+        sibling = self.root / "proj-sibling"; (sibling / ".git").mkdir(parents=True)
+        broad = self.root / "Downloads"; (broad / "new").mkdir(parents=True)
+        self._memory_home(proj, sibling, broad, "/Users/x/{a,b}", "relative/path")
+        known = b.memory_workspaces()
+        self.assertEqual(len(known), 3)  # brace patterns and relative junk are ignored
+        mine, others = b.memory_scope(os.path.realpath(wt), known)
+        self.assertEqual(mine, [os.path.realpath(proj)])  # worktree inherits its project, not the sibling
+        self.assertNotIn(os.path.realpath(proj), others)
+        mine, _ = b.memory_scope(os.path.realpath(broad / "new"), known)
+        self.assertEqual(mine, [])  # a broad ancestor without .git never matches: new workspace = empty memory
+        guard = b.memory_guard(os.path.realpath(wt), known)
+        self.assertIn("Use ONLY those entries", guard)
+        self.assertIn(os.path.realpath(sibling), guard)
+        self.assertIn("new workspace", b.memory_guard(os.path.realpath(broad / "new"), known))
+
+    def test_memory_modes_change_prompt_and_flags(self):
+        capture = self.root / "cap.json"
+        self.fake("import sys,json\nfrom pathlib import Path\nPath(" + repr(str(capture)) + ").write_text(json.dumps({'argv':sys.argv,'stdin':sys.stdin.read()}))\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))\n")
+        self._memory_home(self.cwd)
+        def run(mode, **kw):
+            b.save({**b.load(), "codex_memory": mode})
+            b.exec_codex(self.cfg(), kw.pop("prompt", "do it"), str(self.cwd), **kw)
+            return json.loads(capture.read_text())
+        got = run("scoped")
+        self.assertTrue(got["stdin"].startswith("WORKSPACE BINDING"))
+        self.assertNotIn("memories.use_memories=false", got["argv"])
+        got = run("scoped", prompt=None, review=["--uncommitted"])  # native review cannot take a guard prompt
+        self.assertIn("memories.use_memories=false", got["argv"])
+        self.assertNotIn("memories.generate_memories=false", got["argv"])
+        got = run("off")
+        self.assertNotIn("WORKSPACE BINDING", got["stdin"])
+        self.assertIn("memories.use_memories=false", got["argv"])
+        self.assertIn("memories.generate_memories=false", got["argv"])
+        got = run("on")
+        self.assertNotIn("WORKSPACE BINDING", got["stdin"])
+        self.assertNotIn("memories.use_memories=false", got["argv"])
+        with self.assertRaises(SystemExit):
+            b.validate("codex_memory", "bogus")
+
+    def test_quota_is_read_from_the_session_rollout(self):
+        day = Path(self.env["CODEX_HOME"]) / "sessions" / "2026" / "10" / "04"
+        day.mkdir(parents=True)
+        limits = {"primary": {"used_percent": 48.0, "window_minutes": 10080, "resets_at": 1791594132}, "secondary": None,
+                  "credits": {"has_credits": True, "balance": "62270.44"}}
+        event = {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": limits}}
+        (day / "rollout-2026-10-04T00-00-00-thread-q.jsonl").write_text("noise\n" + json.dumps(event) + "\n")
+        text = b.read_quota("thread-q")
+        self.assertIn("48% of weekly used, resets", text)
+        self.assertIn("credits 62,270", text)
+        self.assertIsNone(b.read_quota("missing"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            b.cmd_usage(None)
+        self.assertIn("48% of weekly used", out.getvalue())
+        self.fake("import json\nprint(json.dumps({'type':'thread.started','thread_id':'thread-q'}))\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))\n")
+        r = b.exec_codex(self.cfg(), "go", str(self.cwd))
+        self.assertIn("quota: 48% of weekly used", r["digest"])
+
 
 if __name__ == "__main__":
     unittest.main()

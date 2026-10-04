@@ -8,7 +8,7 @@ disable-model-invocation: true
 Run `${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py` with the right subcommand for: $ARGUMENTS
 
 - No args / "show" → `config show`
-- "set k=v ..." → `config set k=v ...` (keys: model, effort[low|medium|high|xhigh|max|ultra], sandbox[read-only|workspace-write|danger-full-access], timeout, profile, codex_bin, extra_args, roles, model_reasoning, model_bulk, review_model, review_effort, team_policy, max_parallel)
+- "set k=v ..." → `config set k=v ...` (keys: model, effort[low|medium|high|xhigh|max|ultra], sandbox[read-only|workspace-write|danger-full-access], timeout, profile, codex_bin, extra_args, roles, model_reasoning, model_bulk, review_model, review_effort, team_policy, max_parallel, codex_memory[scoped|off|on])
 - "reset" → `config reset`
 - "models" → `models` (lists models and the efforts each supports; check effort is supported by the chosen model)
 - Natural language ("use terra with high effort") → translate to `config set`.
@@ -22,3 +22,5 @@ Structured values must be shell-quoted:
 - `config set 'extra_args=["--add-dir","/path with spaces"]'`: JSON string array, or `config set 'extra_args=--add-dir "/path with spaces"'` for shell-style argument parsing.
 
 Invalid structured values are rejected without changing the settings file. Corrupt/unreadable settings stop show/set and execution with the filename. Explicit `config reset` moves the bad file to `settings.json.corrupt-<timestamp>` before restoring defaults. `CODEX_BRIDGE_HOME` overrides the bridge settings/jobs/cache directory; it does not change Codex's own configuration.
+
+`codex_memory`: `scoped` (default) binds Codex's global memory to the run's workspace so look-alike projects cannot bleed into each other; `off` disables memory read and write; `on` is Codex's native behaviour. `usage` prints the latest Codex quota reading.

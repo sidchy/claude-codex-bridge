@@ -16,7 +16,7 @@ Subcommands:
 Persistent settings: ~/.claude/codex-bridge/settings.json
 Per-call flags override them: --model --effort --sandbox --cd --add-dir --timeout --profile
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile
+import argparse, glob, json, os, shutil, subprocess, sys, tempfile
 import contextlib, fcntl, re, signal, time, hashlib, shlex, selectors
 from pathlib import Path
 from collections import deque
@@ -37,6 +37,7 @@ DEFAULTS = {
     "review_effort": "high",
     "team_policy": True,               # tell Codex how/when to spawn sub-agents and with which models
     "max_parallel": 4,
+    "codex_memory": "scoped",  # scoped = bind Codex's global memory to this workspace; off = no memory read/write; on = native
     "roles": {},  # user overrides/additions, merged over ROLES below
 }
 
@@ -129,6 +130,9 @@ def validate(k, v):
             return value
         except (ValueError, TypeError):
             fail("must be a positive integer")
+    elif k == "codex_memory":
+        if not isinstance(v, str) or v not in ("scoped", "off", "on"):
+            fail("must be one of ['off', 'on', 'scoped']")
     elif k == "team_policy":
         if isinstance(v, bool):
             return v
@@ -415,6 +419,131 @@ def _gitstate(cd, include=()):
         return None
 
 
+def memory_workspaces():
+    """Workspace paths that Codex's global MEMORY.md has entries for (from its `applies_to: cwd=` lines)."""
+    path = os.path.join(_codex_home(), "memories", "MEMORY.md")
+    found = []
+    try:
+        for line in open(path, encoding="utf-8", errors="ignore"):
+            m = re.match(r"\s*applies_to:\s*cwd=([^;]+)", line)
+            if m:
+                for item in m.group(1).split(","):
+                    item = item.strip()
+                    if not item.startswith("/") or "{" in item or "}" in item:  # skip brace patterns / junk
+                        continue
+                    item = os.path.realpath(item)
+                    if item not in found:
+                        found.append(item)
+    except OSError:
+        pass
+    return found
+
+
+def memory_scope(cdir, known=None):
+    """(mine, others): memory workspaces that belong to `cdir`, and those that do not. A workspace
+    belongs to the run if it is the run's directory, or a git project root containing it (so a git worktree
+    or subfolder inherits its project's memory); broad ancestors such as ~/Downloads never match."""
+    known = memory_workspaces() if known is None else known
+    mine, others = [], []
+    for w in known:
+        inside = cdir == w or cdir.startswith(w.rstrip(os.sep) + os.sep)
+        if inside and (cdir == w or os.path.isdir(os.path.join(w, ".git"))):
+            mine.append(w)
+        else:
+            others.append(w)
+    return mine, others
+
+
+def memory_guard(cdir, known=None):
+    """Codex keeps ONE global memory for every project and finds entries by keyword, so similar projects
+    bleed into each other. Tell it exactly which entries are this workspace's, from the bridge side."""
+    mine, others = memory_scope(cdir, known)
+    head = f"WORKSPACE BINDING: this run belongs to exactly one workspace: {cdir}. "
+    if mine:
+        rule = ("In the Memory folder, the entries that belong to this workspace are those in MEMORY.md whose "
+                "`applies_to: cwd=` is: " + "; ".join(mine) + ". Use ONLY those entries (and the rollout summaries "
+                "they point to). ")
+    else:
+        rule = ("No memory entry belongs to this workspace yet: it is a new workspace (its memory will build up "
+                "from runs here). Treat memory as EMPTY: do not search MEMORY.md or rollout summaries for guidance, "
+                "even if keywords look familiar. ")
+    if others:
+        shown = "; ".join(others[:8]) + (" ..." if len(others) > 8 else "")
+        rule += ("Entries for other workspaces (" + shown + ") belong to different projects, even when names or "
+                 "topics look similar: never use, quote or act on them. ")
+    return head + rule + "The brief and the files in this workspace override memory."
+
+
+def _codex_home():
+    return os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
+
+
+def _quota_from_limits(rl):
+    """Format a rate_limits object from a Codex rollout, e.g. '89% of weekly used, resets 10-10 09:02'."""
+    if not isinstance(rl, dict):
+        return None
+    bits = []
+    for key in ("primary", "secondary"):
+        w = rl.get(key)
+        if not isinstance(w, dict) or w.get("used_percent") is None:
+            continue
+        minutes = w.get("window_minutes")
+        label = {10080: "weekly", 300: "5h", 1440: "daily"}.get(minutes, f"{minutes}min" if minutes else "window")
+        reset = ""
+        if w.get("resets_at"):
+            reset = ", resets " + time.strftime("%m-%d %H:%M", time.localtime(w["resets_at"]))
+        bits.append(f"{w['used_percent']:g}% of {label} used{reset}")
+    credits = rl.get("credits") or {}
+    if credits.get("has_credits") and credits.get("balance") not in (None, "", "0"):
+        try:
+            bits.append(f"credits {float(credits['balance']):,.0f}")
+        except (TypeError, ValueError):
+            pass
+    return "; ".join(bits) or None
+
+
+def _last_rate_limits(path, tail=262144):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - tail))
+            chunk = f.read().decode("utf-8", "ignore")
+    except OSError:
+        return None
+    found = None
+    for line in chunk.splitlines():
+        if '"rate_limits"' not in line:
+            continue
+        try:
+            payload = json.loads(line).get("payload", {})
+        except ValueError:
+            continue
+        if payload.get("type") == "token_count" and payload.get("rate_limits"):
+            found = payload["rate_limits"]
+    return found
+
+
+def read_quota(thread):
+    """Quota as reported by Codex during this run (read from the session rollout, newest reading wins)."""
+    if not thread:
+        return None
+    for path in glob.glob(os.path.join(_codex_home(), "sessions", "*", "*", "*", f"rollout-*{thread}*.jsonl")):
+        return _quota_from_limits(_last_rate_limits(path))
+    return None
+
+
+def cmd_usage(_):
+    files = sorted(glob.glob(os.path.join(_codex_home(), "sessions", "*", "*", "*", "rollout-*.jsonl")),
+                   key=os.path.getmtime, reverse=True)[:25]
+    for path in files:
+        quota = _quota_from_limits(_last_rate_limits(path))
+        if quota:
+            print(f"Codex quota: {quota}  (as of the last Codex run, {time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(path)))})")
+            return
+    print("no quota information found in recent Codex sessions")
+
+
 def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None,
                jid=None, live=False, kind="task", name=None):
     """Run codex once, streaming events to <run>/events.jsonl. Returns dict(ok, text, thread, error,
@@ -428,6 +557,9 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
         jid = new_run(kind, cfg, prompt, cdir, review, name=name)
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
+    memory = s.get("codex_memory", "scoped")
+    if memory == "scoped" and prompt:
+        prompt = memory_guard(cdir) + "\n\n" + prompt
     cmd = [codex_bin()]
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as output_file:
         out = output_file.name
@@ -442,6 +574,10 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     cmd += ["--json", "--skip-git-repo-check", "-o", out,
             "-m", cfg["model"], "-c", f'model_reasoning_effort="{cfg["effort"]}"',
             "-c", 'approval_policy="never"']
+    if memory == "off" or (memory == "scoped" and review is not None):  # native review can't take a guard prompt
+        cmd += ["-c", "memories.use_memories=false"]
+        if memory == "off":
+            cmd += ["-c", "memories.generate_memories=false"]
     if review is not None:
         cmd += ["-c", f'sandbox_mode="{cfg["sandbox"]}"'] + review
     elif resume:
@@ -555,8 +691,11 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     if (before and before["capped"]) or (after and after["capped"]):
         parts.append(f"hash snapshot capped ({HASH_FILE_LIMIT} files / {HASH_BYTE_LIMIT} bytes); touched list incomplete")
     parts.append(f"tokens in/out {u.get('input_tokens', '?')}/{u.get('output_tokens', '?')}")
+    res["quota"] = read_quota(res["thread"])
+    if res["quota"]:
+        parts.append("quota: " + res["quota"])
     res["digest"] = " · ".join(parts)
-    _jwrite(jid, digest=res["digest"], thread=res["thread"])
+    _jwrite(jid, digest=res["digest"], thread=res["thread"], quota=res["quota"])
     return res
 
 
@@ -1417,7 +1556,7 @@ def main():
     c = sub.add_parser("config")
     c.add_argument("action", nargs="?", default="show", choices=["show", "set", "reset"])
     c.add_argument("pairs", nargs="*")
-    sub.add_parser("models"); sub.add_parser("roles")
+    sub.add_parser("models"); sub.add_parser("roles"); sub.add_parser("usage")
     status = sub.add_parser("status")
     status.add_argument("job", nargs="?", default="last"); status.add_argument("--name")
     status.add_argument("--json", action="store_true")
@@ -1440,7 +1579,7 @@ def main():
     pl = sub.add_parser("parallel"); pl.add_argument("file", help="JSON task list file or -")
     pl.add_argument("--max", type=int)
     a = ap.parse_args()
-    {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "parallel": cmd_parallel,
+    {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "usage": cmd_usage, "parallel": cmd_parallel,
         "review": cmd_review, "watch": cmd_watch, "log": cmd_log, "attach": cmd_attach, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "_job": cmd__job}.get(
         a.cmd, lambda x: run_codex(x, a.cmd == "resume"))(a)
 
