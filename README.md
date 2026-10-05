@@ -73,6 +73,7 @@ Every run is logged under `~/.claude/codex-bridge/jobs/`.
 | "what's it doing?" | Live timeline of Codex's messages, commands, exit codes and sub-agents. In the desktop app it opens in a terminal pane. |
 | "show me what happened" | Replays the transcript. |
 | "stop" | Kills Codex and everything it started, then lists any partial changes. |
+| "tell it to do X instead" | Interrupts the step in progress (its tools are stopped too) and continues the same Codex session with your guidance, so context and prompt cache are kept. It does not start a new session. |
 | "I'll take over" | Gives you a `codex resume <session>` line to run yourself. |
 
 Jobs longer than about 30 seconds go to the background on their own. For big or risky changes (many files, deletes, migrations), Claude first gets a read-only plan from Codex and asks you before going ahead. Say "just do it" to skip that.
@@ -132,6 +133,7 @@ The plugin is a thin layer over `codex/scripts/codex_bridge.py`, which you can c
 run [--name L] [--role R] [--model M] [--effort E] [--sandbox S] [--cd DIR] [--background] [--continue] -
 resume --session ID "<message>"
 review [--base REF | --commit SHA] [--adversarial] [--background] [focus ...]
+steer [id | --name L] "<message>"
 jobs | status | watch | log [--since N] [--tail N] [--full] | attach | wait | result | cancel   # optional job id or --name
 parallel tasks.json
 roles | models | usage | config [show | set k=v | reset]

@@ -4,6 +4,8 @@
 Subcommands:
   run     [flags] [PROMPT|-]   run a task via `codex exec` (prompt from arg or stdin)
   resume  [flags] [PROMPT|-]   continue the last (or --session ID) Codex session
+  steer [job] [--name LABEL] [--foreground] MESSAGE|-
+          safely interrupt the current step and resume the SAME session with guidance
   config  [show|set k=v ...|reset]   persistent defaults
   review [--base B|--commit S] [--adversarial] [focus] [--background]
   watch [id] (live timeline) | log [id] [--full] (transcript) | attach [id] (take over interactively)
@@ -323,7 +325,7 @@ def cmd_models(_):
 
 
 def cmd_status(a):
-    if getattr(a, "json", False):
+    if getattr(a, "json", False) or getattr(a, "job", "last") != "last" or getattr(a, "name", None):
         print(json.dumps(compact_state(_refresh(_resolve_job(a.job, a.name))), separators=(",", ":")))
         return
     print(subprocess.run([codex_bin(), "--version"], capture_output=True, text=True).stdout.strip())
@@ -642,7 +644,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
         jid = new_run(kind, cfg, prompt, cdir, review, name=name)
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
-    memory = s.get("codex_memory", "scoped")
+    memory = cfg.get("session_memory", s.get("codex_memory", "scoped"))
     _jwrite(jid, codex_memory=memory, native_review=review is not None)
     if memory == "scoped" and prompt:
         prompt = memory_guard(cdir) + "\n\n" + prompt
@@ -895,6 +897,7 @@ def prepare_run(a, resume):
                       f"{k}={inherited}. To change it, start a NEW session with `run`.", file=sys.stderr)
             cfg[k] = inherited
         cfg["profile"] = st.get("profile", cfg["profile"])
+        cfg["session_memory"] = st.get("codex_memory", load().get("codex_memory", "scoped"))
     elif session:
         resume = True
         cfg["sandbox"] = "unknown"
@@ -1054,7 +1057,7 @@ def verify_processes(tracked, snapshot):
             and not snapshot[pid][2].startswith("Z")}
 
 
-def collect_descendants(root, tracked, snapshot, root_identity=None, owned_child=False):
+def collect_descendants(root, tracked, snapshot, root_identity=None, owned_child=False, excluded_group=None):
     """Only a verified process identity can establish ownership of descendants."""
     tracked = verify_processes(tracked, snapshot)
     if snapshot is None:
@@ -1064,7 +1067,7 @@ def collect_descendants(root, tracked, snapshot, root_identity=None, owned_child
         tracked[root] = {"identity": row[3], "pgid": row[1]}
     while True:
         previous = len(tracked)
-        groups = {r["pgid"] for r in tracked.values() if r["pgid"] > 1 and r["pgid"] != os.getpgrp()}
+        groups = {r["pgid"] for r in tracked.values() if r["pgid"] > 1 and r["pgid"] != os.getpgrp() and r["pgid"] != excluded_group}
         for pid, (parent, group, status, identity) in snapshot.items():
             if pid != os.getpid() and pid != root and (parent in tracked or group in groups) and not status.startswith("Z"):
                 tracked[pid] = {"identity": identity, "pgid": group}
@@ -1112,13 +1115,15 @@ def targets_alive(tracked, snapshot, fallback_group=None):
     return False
 
 
-def terminate_group(pgid, process=None, jid=None):
+def terminate_group(pgid, process=None, jid=None, legacy_root=None):
     """Bounded tree cleanup; verify identities before discovery and signalling."""
-    if not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
+    if legacy_root is None and (not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp()):
         raise OSError(f"unsafe or missing process group: {pgid}")
     st = (_jread(jid) or {}) if jid else {}
     tracked = recorded_processes(st)
-    root_identity = st.get("child_identity")
+    root = legacy_root[0] if legacy_root else pgid
+    excluded_group = legacy_root[2] if legacy_root else None
+    root_identity = legacy_root[1] if legacy_root else st.get("child_identity")
     root_reused = st.get("child_identity_mismatch", False)
     failures = []
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -1129,23 +1134,24 @@ def terminate_group(pgid, process=None, jid=None):
             snapshot = process_snapshot()
             if jid and not root_identity:
                 root_identity = (_jread(jid) or {}).get("child_identity")
-            if snapshot is not None and pgid in snapshot and root_identity:
-                root_reused = root_reused or snapshot[pgid][3] != root_identity
-            tracked = collect_descendants(pgid, tracked, snapshot, root_identity, owned_child and not root_reused)
-            if not root_identity and pgid in tracked:
-                root_identity = tracked[pgid]["identity"]
+            if snapshot is not None and root in snapshot and root_identity:
+                root_reused = root_reused or snapshot[root][3] != root_identity
+            tracked = collect_descendants(root, tracked, snapshot, root_identity, owned_child and not root_reused, excluded_group)
+            if not root_identity and root in tracked:
+                root_identity = tracked[root]["identity"]
             remember_processes(jid, tracked, snapshot)
             # Re-check immediately before sending signals. Group ownership needs
             # a currently verified member; a recycled numeric PGID is not enough.
             current = process_snapshot()
             tracked = verify_processes(tracked, current)
-            if current is not None and pgid in current and root_identity:
-                root_reused = root_reused or current[pgid][3] != root_identity
+            if current is not None and root in current and root_identity:
+                root_reused = root_reused or current[root][3] != root_identity
             remember_processes(jid, tracked, current)
-            fallback = pgid if not root_reused else None
+            fallback = pgid if not root_reused and legacy_root is None else None
             groups = ({record["pgid"] for record in tracked.values()} if current is not None
                       else ({fallback} if fallback else set()))
             groups.discard(os.getpgrp())
+            groups.discard(excluded_group)
             pids = set(tracked) if current is not None else set()
             for group in sorted(groups, key=lambda g: g == pgid):
                 # Anchor the signal to member identities, not just the group ID.
@@ -1176,8 +1182,8 @@ def terminate_group(pgid, process=None, jid=None):
             snapshot = process_snapshot()
             tracked = verify_processes(tracked, snapshot)
             remember_processes(jid, tracked, snapshot)
-            unknown_root = (snapshot is not None and pgid in snapshot and not root_identity
-                            and not snapshot[pgid][2].startswith("Z") and not owned_child)
+            unknown_root = (snapshot is not None and root in snapshot and not root_identity
+                            and not snapshot[root][2].startswith("Z") and not owned_child)
             if not unknown_root and not targets_alive(tracked, snapshot, fallback):
                 return
             if time.monotonic() >= deadline:
@@ -1215,7 +1221,7 @@ def child_lines(process, prompt, timeout, jid):
                     root_identity = tracked[process.pid]["identity"]
                 remember_processes(jid, tracked, snapshot)
                 next_scan = time.monotonic() + 0.5
-            if (_jread(jid) or {}).get("status") in ("cancelling", "cancelled"):
+            if (_jread(jid) or {}).get("status") in ("cancelling", "cancelled", "steered"):
                 if cancel_deadline is None:
                     cancel_deadline = now + 2 * CANCEL_GRACE + 2 * PS_TIMEOUT + REAP_TIMEOUT
                 if now >= cancel_deadline:
@@ -1259,7 +1265,7 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
         Path(_job_path(jid, "spec.json")).write_text(json.dumps(spec, ensure_ascii=False))
     _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.realpath(cd), model=cfg["model"], effort=cfg["effort"],
             started=time.time(), pid=os.getpid(), pgid=None, name=name, sandbox=cfg["sandbox"], profile=cfg["profile"],
-            codex_memory=load().get("codex_memory", "scoped"), native_review=review is not None,
+            codex_memory=cfg.get("session_memory", load().get("codex_memory", "scoped")), native_review=review is not None,
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
     return jid
 
@@ -1267,11 +1273,11 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
 def finish_run(r):
     with job_state(r["jid"]) as st:
         st["worker_finished"] = True
-        if st.get("status") == "cancelled":
+        if st.get("status") in ("cancelled", "steered"):
             return
         if r.get("cleanup_pending"):
             st.update(status="cleanup_pending",
-                      cleanup_target="cancelled" if st.get("status") == "cancelling" else st.get("cleanup_target", "failed"),
+                      cleanup_target=st.get("cleanup_target", "failed"),
                       cleanup_error=r["cleanup_error"], error=r["error"],
                       timed_out=r.get("timed_out", False), usage=r["usage"])
             st.pop("finished", None)
@@ -1385,17 +1391,22 @@ def _refresh(jid):
                 execution_alive = True  # legacy/initially unobservable child: cannot confirm exit
             if not worker_alive and not execution_alive:
                 if st["status"] in ("cancelling", "cleanup_pending"):
-                    target = "cancelled" if st["status"] == "cancelling" else st.get("cleanup_target", "failed")
+                    target = st.get("cleanup_target", "cancelled" if st["status"] == "cancelling" else "failed")
+                    if target == "steered" and not st.get("steered_to"):
+                        if _alive(st.get("steering_pid")):
+                            return dict(st)  # steering still owns the replacement reservation
+                        target = "failed"
+                        st["error"] = "steering interrupted before replacement job was reserved"
                     st.update(status=target, finished=time.time())
                     if target == "failed":
                         Path(_job_path(jid, "result.txt")).write_text("FAILED: " + st.get("error", "cleanup completed"))
                 else:
-                    st.update(status="failed", error="worker process died")
+                    st.update(status="failed", error="worker process gone (legacy job)" if "pgid" not in st else "worker process died")
         return dict(st)
 
 
 def compact_state(st):
-    return {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error")}
+    return {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error", "steered_to", "steered_from")}
 
 
 def cmd_jobs(a):
@@ -1411,7 +1422,9 @@ def cmd_jobs(a):
         st = _refresh(jid)
         age = f"{int((time.time()-st.get('started', time.time()))/60)}m"
         print(f"{jid:<17}{st.get('kind',''):<8}{st.get('status',''):<10}{age:<7}"
-              f"{st.get('model','')+' '+st.get('effort',''):<22}{st.get('title','')}")
+              f"{st.get('model','')+' '+st.get('effort',''):<22}{st.get('title','')}"
+              + (f" steered -> {st['steered_to']}" if st.get("steered_to") else "")
+              + (f" steered from {st['steered_from']}" if st.get("steered_from") else ""))
 
 
 def cmd_result(a):
@@ -1433,30 +1446,136 @@ def cmd_wait(a):
     cmd_result(argparse.Namespace(job=jid))
 
 
-def cmd_cancel(a):
-    jid = _resolve_job(a.job, getattr(a, "name", None))
+def legacy_process(jid, st):
+    """Verify the legacy root without trusting a recycled numeric PID."""
+    pid = st.get("pid")
+    manual = f"kill {pid}"
+    before = process_snapshot()
+    row = before.get(pid) if before is not None else None
+    if (before is not None and (row is None or row[2].startswith("Z"))) or not _alive(pid):
+        with job_state(jid) as state:
+            state.update(status="failed", error="worker process gone (legacy job)", finished=time.time())
+        print(f"worker process gone (legacy job); cannot verify pid {pid}; manual command: {manual}", file=sys.stderr)
+        return None
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
+                                text=True, timeout=PS_TIMEOUT, check=True)
+        argv = shlex.split(result.stdout.strip())
+        worker = (any(os.path.basename(v) == "codex_bridge.py" for v in argv)
+                  and any(argv[i:i+2] == ["_job", jid] for i in range(len(argv))))
+        # A recorded direct Codex child is also eligible; never accept arbitrary
+        # shell text merely mentioning Codex or the job id.
+        executable = os.path.basename(argv[0]) if argv else ""
+        codex = (pid == st.get("child_pid") and executable in ("codex", "codex.exe") and "exec" in argv)
+        after = process_snapshot()
+        recorded_identity = st.get("child_identity") if pid == st.get("child_pid") else st.get("worker_identity")
+        if (row and after is not None and after.get(pid) == row and (worker or codex)
+                and (not recorded_identity or row[3] == recorded_identity)):
+            return pid, row[3], row[1]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    with job_state(jid) as state:
+        if state.get("status") == "cleanup_pending" and not state.get("pgid"):
+            state.update(status="running", error="legacy process identity unverified")
+    sys.exit(f"cannot verify legacy pid {pid} as codex_bridge.py _job {jid} or recorded Codex child; "
+             f"nothing signalled; manual command: {manual}")
+
+
+def stop_job(jid, target="cancelled", defer_terminal=False):
+    st = _jread(jid) or {}
+    if st.get("status") not in ACTIVE:
+        return False
+    legacy = ("pgid" not in st or (st.get("pgid") is None and st.get("thread") and st.get("pid") != os.getpid()))
+    root = legacy_process(jid, st) if legacy else None
+    if legacy and root is None:
+        return False
     with job_state(jid) as st:
         if st.get("status") not in ACTIVE:
-            print(f"job {jid} is {st.get('status')}")
-            return
-        st["status"] = "cancelling"
-        st["cleanup_target"] = "cancelled"
-        st.setdefault("cancel_reason", "cancel requested")
+            return False
+        st.update(status="cancelling", cleanup_target=target)
+        if target == "steered":
+            st["steering_pid"] = os.getpid()
+        st["cancel_reason"] = "interrupted for user guidance" if target == "steered" else "cancel requested"
         pgid = st.get("pgid")
-        legacy = "pgid" not in st
     try:
         if legacy:
-            raise OSError("no execution process group recorded for this legacy job; cannot safely confirm cancellation")
-        if pgid is not None:
+            terminate_group(None, jid=jid, legacy_root=root)
+        elif pgid is not None:
             terminate_group(pgid, jid=jid)
     except OSError as exc:
         with job_state(jid) as st:
-            st.update(status="cleanup_pending", cleanup_target="cancelled", cleanup_error=str(exc),
+            st.update(status="cleanup_pending", cleanup_target="failed" if target == "steered" else target, cleanup_error=str(exc),
                       error=(st.get("error", "") + f"\ncancellation failed: {exc}").strip())
         sys.exit(f"cancellation failed for {jid}: {exc}; status remains cleanup_pending")
-    with job_state(jid) as st:
-        st.update(status="cancelled", finished=time.time())
-    print(f"cancelled {jid}")
+    if not defer_terminal:
+        with job_state(jid) as st:
+            st.update(status=target, finished=time.time())
+    return True
+
+
+def cmd_cancel(a):
+    jid = _resolve_job(a.job, getattr(a, "name", None))
+    stopped = stop_job(jid)
+    print(f"cancelled {jid}" if stopped else f"job {jid} is {(_jread(jid) or {}).get('status')}")
+
+
+STEER_SESSION_WAIT = 20.0
+STEER_FRAME = (
+    "The user was watching your work live and sends this guidance. "
+    "Your previous turn was interrupted: any command that was running was stopped and may have partially run, "
+    "so check the current state of files/git before redoing anything. Do not repeat finished steps. "
+    "Continue the original task with the guidance applied, and start your reply with one line saying how your plan changed."
+)
+
+
+def cmd_steer(a):
+    message = sys.stdin.read() if a.message == "-" else a.message
+    if not message.strip():
+        sys.exit("empty guidance message")
+    jid = _resolve_job(a.job, getattr(a, "name", None))
+    deadline = time.monotonic() + STEER_SESSION_WAIT
+    while True:
+        old = _jread(jid) or {}
+        if old.get("thread"):
+            break
+        if time.monotonic() >= deadline:
+            sys.exit("session not started yet, retry shortly; nothing interrupted")
+        time.sleep(0.1)
+    prompt = STEER_FRAME + "\n\n" + message
+    # All run/resume entry points reserve sessions under this lock. Hold it
+    # across cleanup and reservation so no competing continuation slips in.
+    with file_lock(os.path.join(BRIDGE_HOME, "sessions", "index.lock")):
+        old = _jread(jid)
+        for other in ordered_jobs():
+            if other == jid:
+                continue
+            st = _refresh(other)
+            same_name = old.get("name") and st.get("name") == old["name"] and st.get("cwd") == old["cwd"]
+            if st.get("status") in ACTIVE and (st.get("thread") == old["thread"] or same_name):
+                sys.exit(f"session {old['thread']} already has active job {other}; nothing interrupted")
+        settings = load()
+        cfg = resolve(argparse.Namespace(), settings)
+        for key in ("model", "effort", "sandbox", "profile", "codex_memory"):
+            cfg["session_memory" if key == "codex_memory" else key] = old.get(key, settings.get(key))
+        if cfg["sandbox"] not in SANDBOXES:
+            cfg["sandbox"] = settings["sandbox"]
+        validate_model(cfg, old["cwd"])
+        interrupted = stop_job(jid, "steered", defer_terminal=True)
+        new = new_run("resume", cfg, prompt, old["cwd"], name=old.get("name"))
+        _jwrite(new, thread=old["thread"], steered_from=jid)
+        with job_state(jid) as state:
+            state["steered_to"] = new
+            if interrupted:
+                state.update(status="steered", finished=time.time())
+    if not a.foreground:
+        return start_job("resume", cfg, prompt, old["cwd"], resume=True, session=old["thread"],
+                         name=old.get("name"), jid=new)
+    r = exec_codex(cfg, prompt, old["cwd"], session=old["thread"], resume=True, jid=new, live=True)
+    finish_run(r)
+    if not r["ok"]:
+        sys.exit(f"CODEX FAILED: {r['error']}")
+    print(r["text"])
+    print_footer(r)
 
 
 def _stream(jid, follow, full=False, since=0, tail=None):
@@ -1467,6 +1586,9 @@ def _stream(jid, follow, full=False, since=0, tail=None):
         while not os.path.exists(path) and _refresh(jid).get("status") in ACTIVE:
             time.sleep(0.2)
     if not os.path.exists(path):
+        st = _refresh(jid)
+        if follow and st.get("steered_to"):
+            print(f"steered -> {st['steered_to']}")
         print("next cursor: 0")
         return
     st = _jread(jid) or {}
@@ -1503,7 +1625,8 @@ def _stream(jid, follow, full=False, since=0, tail=None):
                 time.sleep(0.5)
     if follow:
         st = _refresh(jid)
-        print(f"═ {st.get('status')} · {st.get('digest', '')}")
+        link = f" -> {st['steered_to']}" if st.get("steered_to") else ""
+        print(f"═ {st.get('status')}{link} · {st.get('digest', '')}")
     print(f"next cursor: {cursor}", flush=True)
 
 
@@ -1668,12 +1791,17 @@ def main():
     for n in ("result", "cancel", "wait"):
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
         if n == "wait": q.add_argument("--timeout", type=int, default=600)
+    steer = sub.add_parser("steer", help="interrupt safely and guide the same session (background by default)")
+    steer.add_argument("job", nargs="?", default="last")
+    steer.add_argument("--name", help="select a named session in this directory")
+    steer.add_argument("--foreground", action="store_true")
+    steer.add_argument("message", help="guidance text, or - to read stdin")
     sub.add_parser("_job").add_argument("jid")
     pl = sub.add_parser("parallel"); pl.add_argument("file", help="JSON task list file or -")
     pl.add_argument("--max", type=int)
     a = ap.parse_args()
     {"config": cmd_config, "models": cmd_models, "status": cmd_status, "roles": cmd_roles, "usage": cmd_usage, "parallel": cmd_parallel,
-        "review": cmd_review, "watch": cmd_watch, "log": cmd_log, "attach": cmd_attach, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "_job": cmd__job}.get(
+        "review": cmd_review, "watch": cmd_watch, "log": cmd_log, "attach": cmd_attach, "jobs": cmd_jobs, "result": cmd_result, "wait": cmd_wait, "cancel": cmd_cancel, "steer": cmd_steer, "_job": cmd__job}.get(
         a.cmd, lambda x: run_codex(x, a.cmd == "resume"))(a)
 
 

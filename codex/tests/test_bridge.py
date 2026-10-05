@@ -439,9 +439,9 @@ class BridgeTests(unittest.TestCase):
         jid = b.new_run("task", self.cfg(), "hi", str(self.cwd))
         with b.job_state(jid) as st:
             del st["pgid"]
-        with self.assertRaisesRegex(SystemExit, "no execution process group"):
+        with self.assertRaisesRegex(SystemExit, "nothing signalled; manual command: kill"):
             b.cmd_cancel(argparse.Namespace(job=jid))
-        self.assertEqual(b._jread(jid)["status"], "cleanup_pending")
+        self.assertEqual(b._jread(jid)["status"], "running")
 
     def test_r1_resume_passes_recorded_sandbox(self):
         capture = self.root / "resume-argv.json"
@@ -989,6 +989,180 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("select:mcp__terminal__run_in_terminal", prompt)
         self.assertIn("mcp__terminal__stop_terminal_tab", prompt.split("---", 2)[1])  # allowed-tools frontmatter
         self.assertIn("ToolSearch", prompt.split("---", 2)[1])
+
+    def bridge_cli(self, *args, **kw):
+        return subprocess.run([sys.executable, str(SCRIPT)] + list(args), cwd=self.cwd,
+                              env=self.env, capture_output=True, text=True, timeout=15, **kw)
+
+    def await_state(self, jid, predicate):
+        import time
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = b._jread(jid)
+            if predicate(state):
+                return state
+            time.sleep(0.05)
+        self.fail("job did not reach expected state: " + repr(b._jread(jid)))
+
+    def steer_fake(self):
+        self.capture = self.root / "steer-capture.json"
+        self.ready = self.root / "steer-ready"
+        self.fake("import os,subprocess,time\nfrom pathlib import Path\n"
+                  "if 'resume' in sys.argv:\n"
+                  " Path(" + repr(str(self.capture)) + ").write_text(json.dumps({'argv':sys.argv,'stdin':sys.stdin.read(),'cwd':os.getcwd()}))\n"
+                  " print(json.dumps({'type':'thread.started','thread_id':'steer-thread'}))\n"
+                  " print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'steered-ok'}}))\n"
+                  "else:\n"
+                  " child=subprocess.Popen(['sleep','7319'],start_new_session=True)\n"
+                  " Path(" + repr(str(self.ready)) + ").write_text(str(child.pid))\n"
+                  " print(json.dumps({'type':'thread.started','thread_id':'steer-thread'}),flush=True)\n"
+                  " time.sleep(60)\n")
+
+    def assert_process_gone(self, pid):
+        rows = b.process_snapshot()
+        self.assertTrue(pid not in rows or rows[pid][2].startswith('Z'), repr(rows.get(pid)))
+
+    def test_s1_steer_running_tree_same_session_and_links(self):
+        self.steer_fake()
+        b.save({**b.load(), "codex_memory": "off"})
+        first = self.bridge_cli("run", "--background", "--name", "steer-label", "--model", "gpt-6-astra",
+                                "--effort", "high", "--sandbox", "danger-full-access", "begin")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        old = b.ordered_jobs()[0]
+        self.addCleanup(lambda: self.bridge_cli("cancel", old))
+        state = self.await_state(old, lambda st: st.get("thread"))
+        self.wait_ready()
+        child = int(self.ready.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", str(child)], capture_output=True))
+        b.save({**b.load(), "codex_memory": "on", "sandbox": "read-only", "model": "gpt-6-luna", "effort": "low"})
+        guidance = "Keep completed steps.\nOnly change the final answer.\n"
+        result = self.bridge_cli("steer", "--name", "steer-label", "-", input=guidance)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new = b._jread(old)["steered_to"]
+        self.addCleanup(lambda: self.bridge_cli("cancel", new))
+        updated = self.await_state(new, lambda st: st.get("status") not in b.ACTIVE)
+        self.assertEqual(updated["status"], "done")
+        old_state = b._jread(old)
+        self.assertEqual(old_state["status"], "steered")
+        self.assertIn("guidance", old_state["cancel_reason"])
+        self.assertEqual(updated["steered_from"], old)
+        for key in ("thread", "model", "effort", "sandbox", "codex_memory", "cwd", "name"):
+            self.assertEqual(updated[key], state[key], key)
+        self.assert_process_gone(child)
+        self.assert_process_gone(state["child_pid"])
+        capture = json.loads(self.capture.read_text())
+        self.assertEqual(capture["argv"][capture["argv"].index("resume") + 1], state["thread"])
+        self.assertTrue(capture["stdin"].endswith(guidance))
+        self.assertIn("may have partially run", capture["stdin"])
+        self.assertIn('sandbox_mode="danger-full-access"', capture["argv"])
+        self.assertIn("memories.generate_memories=false", capture["argv"])
+        self.assertIn("watch live", result.stdout)
+        self.assertIn("reminder", result.stdout)
+        self.assertIn("steered -> " + new, self.bridge_cli("watch", old).stdout)
+        self.assertEqual(json.loads(self.bridge_cli("status", old, "--json").stdout)["steered_to"], new)
+        jobs = json.loads(self.bridge_cli("jobs", "--json").stdout)
+        self.assertTrue(any(st["steered_from"] == old for st in jobs))
+        self.assertIn("steered from " + old, self.bridge_cli("jobs").stdout)
+
+    def test_s1_thread_not_started_does_not_interrupt(self):
+        jid = b.new_run("task", self.cfg(), "hi", str(self.cwd))
+        with mock.patch.object(b, "STEER_SESSION_WAIT", 0), mock.patch.object(b, "stop_job") as stop:
+            with self.assertRaisesRegex(SystemExit, "session not started yet, retry shortly"):
+                b.cmd_steer(argparse.Namespace(job=jid, name=None, foreground=False, message="redirect"))
+        stop.assert_not_called()
+        self.assertEqual(b._jread(jid)["status"], "running")
+        self.assertEqual(len(b.ordered_jobs()), 1)
+
+    def test_s1_finished_steer_foreground_and_session_refusal(self):
+        self.steer_fake()
+        old = b.new_run("task", self.cfg(), "hi", str(self.cwd), name="label")
+        b._jwrite(old, status="done", thread="steer-thread")
+        with mock.patch.object(b, "terminate_group") as terminate, contextlib.redirect_stdout(io.StringIO()):
+            b.cmd_steer(argparse.Namespace(job=old, name=None, foreground=True, message="finished guidance"))
+        terminate.assert_not_called()
+        new = b._jread(old)["steered_to"]
+        self.assertEqual(b._jread(old)["status"], "done")
+        self.assertEqual(b._jread(new)["thread"], "steer-thread")
+        self.assertEqual(b._jread(new)["status"], "done")
+        active = b.new_run("resume", self.cfg(), "active", str(self.cwd))
+        b._jwrite(active, thread="steer-thread")
+        with mock.patch.object(b, "stop_job") as stop, self.assertRaisesRegex(SystemExit, "already has active job"):
+            b.cmd_steer(argparse.Namespace(job=old, name=None, foreground=True, message="no"))
+        stop.assert_not_called()
+        self.assertEqual(len(b.ordered_jobs()), 3)
+
+    def legacy_worker(self, jid):
+        script = self.root / "legacy" / "codex_bridge.py"
+        script.parent.mkdir(exist_ok=True)
+        ready = self.root / (jid + "-ready")
+        script.write_text("import subprocess,time\nfrom pathlib import Path\n"
+                          "child=subprocess.Popen(['sleep','7319'],start_new_session=True)\n"
+                          "Path(" + repr(str(ready)) + ").write_text(str(child.pid))\n"
+                          "time.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, str(script), "_job", jid], start_new_session=True)
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+            if ready.exists():
+                subprocess.run(["kill", ready.read_text()], capture_output=True)
+        self.addCleanup(cleanup)
+        self.ready = ready
+        self.wait_ready()
+        with b.job_state(jid) as st:
+            st.pop("pgid", None)
+            st.update(pid=proc.pid, thread="steer-thread")
+        return proc, int(ready.read_text())
+
+    def test_s2_legacy_cancel_and_steer_real_trees(self):
+        self.steer_fake()
+        for action in ("cancel", "steer"):
+            old = b.new_run("task", self.cfg(), "hi", str(self.cwd))
+            proc, child = self.legacy_worker(old)
+            with contextlib.redirect_stdout(io.StringIO()):
+                if action == "cancel":
+                    b.cmd_cancel(argparse.Namespace(job=old))
+                else:
+                    b.cmd_steer(argparse.Namespace(job=old, name=None, foreground=True, message="legacy guidance"))
+            proc.wait(timeout=3)
+            self.assert_process_gone(child)
+            self.assertEqual(b._jread(old)["status"], "cancelled" if action == "cancel" else "steered")
+            if action == "steer":
+                new = b._jread(old)["steered_to"]
+                self.assertEqual(b._jread(new)["thread"], "steer-thread")
+                self.assertEqual(b._jread(new)["status"], "done")
+
+    def test_s2_unverifiable_and_gone_legacy_pid(self):
+        proc = subprocess.Popen(["sleep", "7319"], start_new_session=True)
+        self.addCleanup(lambda: proc.wait(timeout=3))
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        old = b.new_run("task", self.cfg(), "hi", str(self.cwd))
+        with b.job_state(old) as st:
+            del st["pgid"]
+            st.update(pid=proc.pid, thread="legacy-thread")
+        for command in (lambda: b.cmd_cancel(argparse.Namespace(job=old)),
+                        lambda: b.cmd_steer(argparse.Namespace(job=old, name=None, foreground=True, message="hi"))):
+            with self.assertRaisesRegex(SystemExit, "manual command: kill " + str(proc.pid)):
+                command()
+            self.assertIsNone(proc.poll())
+            self.assertEqual(b._jread(old)["status"], "running")
+        proc.kill()
+        proc.wait(timeout=3)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            b.cmd_cancel(argparse.Namespace(job=old))
+        self.assertEqual(b._jread(old)["status"], "failed")
+        self.assertEqual(b._jread(old)["error"], "worker process gone (legacy job)")
+        self.assertIn("kill " + str(proc.pid), err.getvalue())
+
+    def test_s3_steering_docs_and_help(self):
+        doc = (SCRIPT.parents[1] / "commands" / "run.md").read_text()
+        correction = next(line for line in doc.splitlines() if line.startswith("- Corrections"))
+        for required in ("steer <id>", "steer --name", "SAME session", "0.8.0", "interrupts", ".git", "network"):
+            self.assertIn(required, correction)
+        help_text = self.bridge_cli("steer", "--help")
+        self.assertEqual(help_text.returncode, 0)
+        for flag in ("--foreground", "--name", "message"):
+            self.assertIn(flag, help_text.stdout)
 
 
 if __name__ == "__main__":

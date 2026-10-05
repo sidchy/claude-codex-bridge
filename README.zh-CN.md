@@ -73,6 +73,7 @@ Claude 在第一次调用前评估任务，并在整个 Codex 会话里保持这
 | "它在干嘛？" | 实时时间线，显示 Codex 说的话、执行的命令、退出码和子代理。桌面端会在终端面板里打开。 |
 | "给我看看过程" | 回放完整记录。 |
 | "停" | 终止 Codex 和它启动的所有进程，并列出已经产生的部分改动。 |
+| "让它改成做 X" | 中断正在进行的这一步（它启动的工具也一起停掉），在同一个 Codex 会话里带着你的引导继续，保留上下文和缓存，不会另开新会话。 |
 | "我来接手" | 给你一行 `codex resume <会话>`，自己运行就能接着干。 |
 
 超过约 30 秒的任务会自动转后台。大改动或有风险的操作（很多文件、删除、数据迁移），Claude 会先让 Codex 以只读方式出方案，给你看并等你确认再动手。说一句"直接做"可以跳过。
@@ -132,6 +133,7 @@ Codex 默认以 `danger-full-access` 和审批策略 `never` 运行，也就是�
 run [--name L] [--role R] [--model M] [--effort E] [--sandbox S] [--cd DIR] [--background] [--continue] -
 resume --session ID "<消息>"
 review [--base REF | --commit SHA] [--adversarial] [--background] [关注点 ...]
+steer [id | --name L] "<消息>"
 jobs | status | watch | log [--since N] [--tail N] [--full] | attach | wait | result | cancel   # 可带任务号或 --name
 parallel tasks.json
 roles | models | usage | config [show | set k=v | reset]
