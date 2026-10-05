@@ -74,6 +74,7 @@ Every run is logged under `~/.claude/codex-bridge/jobs/`.
 | "show me what happened" | Replays the transcript. |
 | "stop" | Kills Codex and everything it started, then lists any partial changes. |
 | "tell it to do X instead" | Interrupts the step in progress (its tools are stopped too) and continues the same Codex session with your guidance, so context and prompt cache are kept. It does not start a new session. |
+| "tell it to do X instead" | Interrupts the step in progress (the tools it started are stopped too) and continues the same Codex session with your guidance, so context and prompt cache are kept. It does not start a new session. |
 | "I'll take over" | Gives you a `codex resume <session>` line to run yourself. |
 
 Jobs longer than about 30 seconds go to the background on their own. For big or risky changes (many files, deletes, migrations), Claude first gets a read-only plan from Codex and asks you before going ahead. Say "just do it" to skip that.
