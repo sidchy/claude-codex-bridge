@@ -21,7 +21,12 @@ class BridgeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # realpath expands Windows 8.3 short names (e.g. KARRYX~1) that PowerShell -LiteralPath rejects.
+        self.root = Path(os.path.realpath(self.tmp.name))
+        # Never let git discover a repository enclosing the temp dir (e.g. a home directory under version control).
+        ceiling = mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(self.tmp.name))})
+        ceiling.start()
+        self.addCleanup(ceiling.stop)
         self.home = self.root / "bridge"
         self.home.mkdir()
         self.cwd = self.root / "repo"
@@ -40,6 +45,23 @@ class BridgeTests(unittest.TestCase):
         self.catalog_patch = mock.patch.object(b, "model_catalog", return_value=self.catalog)
         self.catalog_patch.start()
         self.addCleanup(self.catalog_patch.stop)
+        self.addCleanup(self.cleanup_jobs)
+
+    def cleanup_jobs(self):
+        """Reap background fixtures before Windows removes their open log files."""
+        import time
+        if not Path(b.JOBS).exists():
+            return
+        for jid in b.ordered_jobs():
+            state = b._jread(jid)
+            pid = state.get("pid")
+            if state.get("status") in b.ACTIVE and pid and pid != os.getpid():
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    b.cmd_cancel(argparse.Namespace(job=jid))
+            if pid and pid != os.getpid():
+                deadline = time.monotonic() + 5
+                while b._alive(pid) and time.monotonic() < deadline:
+                    time.sleep(0.02)
 
     def cfg(self, **kw):
         return {**b.DEFAULTS, "preamble": "", **kw}
@@ -48,7 +70,7 @@ class BridgeTests(unittest.TestCase):
         return argparse.Namespace(cd=str(self.cwd), prompt="hello", background=False, add_dir=None, **kw)
 
     def fake(self, code, complete=True):
-        binary = self.root / "fake codex"
+        binary = self.root / ("fake codex.py" if os.name == "nt" else "fake codex")
         binary.write_text("#!/usr/bin/env python3\nimport sys,json\nif 'debug' in sys.argv and 'models' in sys.argv:\n print(" + repr(json.dumps({"models": self.catalog})) + "); sys.exit(0)\n" + code)
         if complete:
             with binary.open("a") as f:
@@ -56,6 +78,29 @@ class BridgeTests(unittest.TestCase):
         binary.chmod(0o755)
         b.save({**b.load(), "codex_bin": str(binary)})
         return binary
+
+    def cleanup_pid(self, pid):
+        if os.name == "nt":
+            row = (b.process_snapshot() or {}).get(pid)
+            if row:
+                b.win.signal_verified(pid, row[3])
+        else:
+            import signal
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def shell_command(self, command, **kwargs):
+        if os.name == "nt":
+            if kwargs.get("cwd"):
+                directory = str(kwargs["cwd"]).replace("'", "''")
+                command = "Set-Location -LiteralPath '" + directory + "'; " + command
+            if kwargs.get("text"):
+                # PowerShell's own errors use the console code page, not UTF-8.
+                kwargs.setdefault("errors", "replace")
+            return subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], **kwargs)
+        return subprocess.run(command, shell=True, **kwargs)
 
     def test_role_sandbox_settings(self):
         for role in ("worker", "debugger"):
@@ -155,7 +200,7 @@ class BridgeTests(unittest.TestCase):
             b.load()
         Path(b.SETTINGS).rmdir()
         pairs = ["model=one", "effort=low", "sandbox=read-only", "profile=custom"]
-        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "config", "set", pair], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for pair in pairs]
+        procs = [subprocess.Popen([sys.executable, "-X", "utf8", str(SCRIPT), "config", "set", pair], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for pair in pairs]
         for proc in procs:
             out, err = proc.communicate(timeout=10)
             self.assertEqual(proc.returncode, 0, err)
@@ -186,7 +231,10 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(any("already has active job" in x for x in results))
         self.assertEqual(len(list(Path(b.JOBS).iterdir())), 1)
         alias = self.root / "alias"
-        alias.symlink_to(self.cwd, target_is_directory=True)
+        if os.name == "nt":
+            alias = self.cwd / "."
+        else:
+            alias.symlink_to(self.cwd, target_is_directory=True)
         args = self.args(name="shared")
         args.cd = str(alias)
         with self.assertRaisesRegex(SystemExit, "already has active job"):
@@ -200,7 +248,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(b._resolve_job(name="keep"), local)
             self.assertEqual(b._resolve_job(other), other)
             for command in ("watch", "log", "result", "wait", "cancel", "attach", "jobs"):
-                out = subprocess.run([sys.executable, str(SCRIPT), command, "--help"], env=self.env, capture_output=True, text=True)
+                out = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), command, "--help"], env=self.env, capture_output=True, text=True)
                 self.assertIn("--name", out.stdout)
         empty = self.root / "empty"
         empty.mkdir()
@@ -229,7 +277,8 @@ class BridgeTests(unittest.TestCase):
         import shlex
         weird = self.root / "space ' $(touch nope)"
         weird.mkdir()
-        binary = self.fake("pass\n")
+        capture = self.root / "attach-argv.json"
+        binary = self.fake("import os\nfrom pathlib import Path\nPath(" + repr(str(capture)) + ").write_text(json.dumps({'argv':sys.argv,'cwd':os.getcwd()}),encoding='utf-8')\n")
         jid = b.new_run("task", self.cfg(profile="my profile"), "hi", str(weird))
         b._jwrite(jid, thread="thread ' special")
         with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaisesRegex(SystemExit, "still running"):
@@ -239,9 +288,21 @@ class BridgeTests(unittest.TestCase):
             b._jwrite(jid, status=status)
             with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
                 b.cmd_attach(argparse.Namespace(job=jid, force=force))
-            tokens = shlex.split(out.getvalue())
-            self.assertEqual(tokens[:7], ["cd", os.path.realpath(weird), "&&", str(binary), "-p", "my profile", "resume"])
-            self.assertEqual(tokens[7], "thread ' special")
+            if os.name == "nt":
+                command = out.getvalue()
+                quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+                self.assertIn("Set-Location -LiteralPath " + quote(os.path.realpath(weird)), command)
+                result = self.shell_command(command, cwd=self.cwd, env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(capture.read_text(encoding="utf-8"))
+                tokens = data["argv"]
+                self.assertEqual(tokens[:5], [str(binary), "-p", "my profile", "resume", "thread ' special"])
+                self.assertEqual(data["cwd"], os.path.realpath(weird))
+                self.assertFalse((weird / "nope").exists())
+            else:
+                tokens = shlex.split(out.getvalue())
+                self.assertEqual(tokens[:7], ["cd", os.path.realpath(weird), "&&", str(binary), "-p", "my profile", "resume"])
+                self.assertEqual(tokens[7], "thread ' special")
 
     def test_raw_output_preserved_and_failure_tail_bounded(self):
         self.fake("import sys\nfor i in range(100): print(str(i)+':'+('x'*500))\nsys.stdout.flush(); print('invalid flag: --bad',file=sys.stderr)\nsys.exit(2)\n")
@@ -267,10 +328,10 @@ class BridgeTests(unittest.TestCase):
         with path.open("a") as f:
             f.write(json.dumps({"type": "raw", "text": "new"}) + "\n")
         self.assertEqual(log(since=3), "new\nnext cursor: 4\n")
-        result = subprocess.run([sys.executable, str(SCRIPT), "status", jid, "--json"], env=self.env, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "status", jid, "--json"], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["id"], jid)
-        result = subprocess.run([sys.executable, str(SCRIPT), "jobs", "--json"], cwd=self.cwd, env=self.env, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "jobs", "--json"], cwd=self.cwd, env=self.env, capture_output=True, text=True)
         self.assertEqual(json.loads(result.stdout)[0]["id"], jid)
 
     def test_digest_hashes_already_modified_and_caps(self):
@@ -295,7 +356,10 @@ class BridgeTests(unittest.TestCase):
             Path(b.JOBS, jid).mkdir(parents=True)
             b._jwrite(jid, id=jid, started=started, cwd=str(self.cwd), thread=jid, kind="task", name="label")
         alias = self.root / "alias"
-        alias.symlink_to(self.cwd, target_is_directory=True)
+        if os.name == "nt":
+            alias = self.cwd / "."
+        else:
+            alias.symlink_to(self.cwd, target_is_directory=True)
         with mock.patch.object(b.os, "getcwd", return_value=str(alias)):
             self.assertEqual(b._resolve_job(), "0101-aaa")
         self.assertEqual(b.find_session(cwd=str(alias))["thread"], "0101-aaa")
@@ -331,16 +395,25 @@ class BridgeTests(unittest.TestCase):
         pool.assert_called_once_with(max_workers=2)
 
     def test_stable_executable_symlink_and_prompt(self):
-        result = subprocess.run([str(SCRIPT), "--help"], env=self.env, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "--help"], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         link = self.home / "bin/codex_bridge.py"
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(link.resolve(), SCRIPT)
-        link.unlink()
-        link.symlink_to(self.root / "stale")
-        result = subprocess.run([str(SCRIPT), "--help"], env=self.env, capture_output=True, text=True)
-        self.assertEqual(link.resolve(), SCRIPT)
-        self.assertTrue(os.access(link, os.X_OK))
+        if os.name == "nt":
+            self.assertFalse(link.is_symlink())
+            self.assertIn(repr(str(SCRIPT)), link.read_text(encoding="utf-8"))
+            link.write_text("raise RuntimeError('stale launcher')", encoding="utf-8")
+        else:
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), SCRIPT)
+            link.unlink()
+            link.symlink_to(self.root / "stale")
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "--help"], env=self.env, capture_output=True, text=True)
+        if os.name == "nt":
+            result = subprocess.run([sys.executable, "-X", "utf8", str(link), "--help"], env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertEqual(link.resolve(), SCRIPT)
+            self.assertTrue(os.access(link, os.X_OK))
         doc = (SCRIPT.parents[1] / "commands/run.md").read_text()
         self.assertIn('"${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run', doc)
         self.assertIn("bin/codex_bridge.py watch <id>", doc)
@@ -384,7 +457,7 @@ class BridgeTests(unittest.TestCase):
         import time
         self.hanging_fake(detached=True)
         def cli(*args):
-            return subprocess.run([str(SCRIPT), *args], cwd=self.cwd, env=self.env,
+            return subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), *args], cwd=self.cwd, env=self.env,
                                   capture_output=True, text=True, timeout=10)
         first = cli("run", "--name", "background", "--background", "hi")
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -401,7 +474,7 @@ class BridgeTests(unittest.TestCase):
         self.ready.unlink()
         taskfile = self.root / "parallel.json"
         taskfile.write_text(json.dumps([{"prompt": "hi", "cd": str(self.cwd)}]))
-        proc = subprocess.Popen([str(SCRIPT), "parallel", str(taskfile)], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen([sys.executable, "-X", "utf8", str(SCRIPT), "parallel", str(taskfile)], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.wait_ready()
             parallel_jid = b.ordered_jobs()[0]
@@ -440,7 +513,7 @@ class BridgeTests(unittest.TestCase):
         jid = b.new_run("task", self.cfg(), "hi", str(self.cwd))
         with b.job_state(jid) as st:
             del st["pgid"]
-        with self.assertRaisesRegex(SystemExit, "nothing signalled; manual command: kill"):
+        with self.assertRaisesRegex(SystemExit, "nothing signalled; manual command: " + ("Stop-Process" if os.name == "nt" else "kill")):
             b.cmd_cancel(argparse.Namespace(job=jid))
         self.assertEqual(b._jread(jid)["status"], "running")
 
@@ -477,13 +550,15 @@ class BridgeTests(unittest.TestCase):
             future = pool.submit(b.exec_codex, self.cfg(timeout=10), "hi", str(self.cwd), jid=jid)
             self.wait_ready()
             descendant = int(self.ready.read_text())
-            self.assertNotEqual(os.getpgid(descendant), b._jread(jid)["pgid"])
+            if os.name != "nt":
+                self.assertNotEqual(os.getpgid(descendant), b._jread(jid)["pgid"])
             with contextlib.redirect_stdout(io.StringIO()):
                 b.cmd_cancel(argparse.Namespace(job=jid))
             future.result(timeout=8)
         self.assert_dead(descendant)
         self.assertEqual(b._jread(jid)["status"], "cancelled")
 
+    @unittest.skipUnless(os.name != "nt", "exercises Unix signals and process groups")
     def test_r3_ps_failure_still_kills_and_bounds_reads(self):
         import signal
         import time
@@ -539,7 +614,11 @@ class BridgeTests(unittest.TestCase):
         state = b._jread(jid)
         self.assertEqual(state["status"], "cancelled")
         self.assertEqual(state["error"], "cancel interrupted")
-        self.assertIn("resume", out.getvalue())
+        if os.name == "nt":
+            self.assertIn("Set-Location -LiteralPath", out.getvalue())
+            self.assertIn("base64.b64decode", out.getvalue())
+        else:
+            self.assertIn("resume", out.getvalue())
         with contextlib.redirect_stderr(io.StringIO()):
             cfg, _, session, resumed, _, new = b.prepare_run(self.args(name="recover"), False)
         self.assertEqual(session, "old-thread")
@@ -572,8 +651,10 @@ class BridgeTests(unittest.TestCase):
             b.model_catalog(self.cfg(profile="one"), str(self.cwd))
             b.model_catalog(self.cfg(profile="two"), str(self.cwd))
         self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[0].args[0][1:3], ["-p", "one"])
-        self.assertEqual(run.call_args_list[1].args[0][1:3], ["-p", "two"])
+        for call, profile in zip(run.call_args_list, ("one", "two")):
+            argv = call.args[0]
+            index = argv.index("-p")
+            self.assertEqual(argv[index:index+2], ["-p", profile])
         self.assertEqual(json.loads((self.home / "models.json").read_text())["context"]["profile"], "two")
 
     def test_r6_reset_preserves_corrupt_settings(self):
@@ -594,14 +675,14 @@ class BridgeTests(unittest.TestCase):
         for timeout in (0, -1, "0", "-1", "abc", 1.5, True):
             with self.subTest(timeout=timeout), self.assertRaisesRegex(SystemExit, "timeout.*positive integer"):
                 b.resolve(self.args(timeout=timeout), self.cfg())
-        result = subprocess.run([str(SCRIPT), "run", "--timeout", "-1", "hi"], env=self.env, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "run", "--timeout", "-1", "hi"], env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("positive integer", result.stderr)
         self.assertFalse(Path(b.JOBS).exists())
         self.fake("print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))\n")
         tasks = self.root / "timeout-tasks.json"
         tasks.write_text(json.dumps([{"prompt": "hi", "timeout": "5", "cd": str(self.cwd)}]))
-        result = subprocess.run([str(SCRIPT), "parallel", str(tasks)], env=self.env, capture_output=True, text=True, timeout=10)
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "parallel", str(tasks)], env=self.env, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ok", result.stdout)
 
@@ -616,17 +697,17 @@ class BridgeTests(unittest.TestCase):
         fresh_env.pop("CODEX_BRIDGE_HOME")
         for action in ("watch", "log", "attach", "result", "wait", "cancel", "jobs"):
             command = b.bridge_command(action, *([] if action == "jobs" else [jid]))
-            self.assertTrue(command.startswith("CODEX_BRIDGE_HOME="))
-            out = subprocess.run(command, shell=True, cwd=self.cwd, env=fresh_env, capture_output=True, text=True, timeout=5)
+            self.assertTrue(command.startswith("$env:CODEX_BRIDGE_HOME=" if os.name == "nt" else "CODEX_BRIDGE_HOME="))
+            out = self.shell_command(command, cwd=self.cwd, env=fresh_env, capture_output=True, text=True, timeout=10)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertNotIn("no jobs", out.stdout + out.stderr)
         with contextlib.redirect_stdout(io.StringIO()) as out:
             b.print_footer({"jid": jid, "thread": "recorded", "digest": "test"})
-        started = subprocess.run([str(SCRIPT), "run", "--background", "hi"], cwd=self.cwd, env=self.env, capture_output=True, text=True, timeout=5)
+        started = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "run", "--background", "hi"], cwd=self.cwd, env=self.env, capture_output=True, text=True, timeout=5)
         self.assertEqual(started.returncode, 0, started.stderr)
         for line in (out.getvalue() + started.stdout).splitlines():
             if "bin/codex_bridge.py" in line:
-                self.assertIn("CODEX_BRIDGE_HOME=", line)
+                self.assertIn("CODEX_BRIDGE_HOME", line)
         # Reap the short-lived background fixture before removing its home.
         import time
         deadline = time.monotonic() + 5
@@ -657,6 +738,7 @@ class BridgeTests(unittest.TestCase):
                 else:
                     self.assertTrue(r["error"])
 
+    @unittest.skipUnless(os.name != "nt", "exercises Unix signals and process groups")
     def test_f2_cleanup_pending_blocks_reuse_and_converges(self):
         import signal
         from concurrent.futures import ThreadPoolExecutor
@@ -705,6 +787,7 @@ class BridgeTests(unittest.TestCase):
                     if state.get("pgid"):
                         b.terminate_group(state["pgid"], jid=jid)
 
+    @unittest.skipUnless(os.name != "nt", "exercises Unix signals and process groups")
     def test_f3_reused_pid_is_not_adopted_or_signalled(self):
         import signal
         import time
@@ -758,6 +841,7 @@ class BridgeTests(unittest.TestCase):
                 proc.wait(timeout=2)
             unrelated.stdout.close()
 
+    @unittest.skipUnless(os.name != "nt", "exercises Unix signals and process groups")
     def test_f3_identity_checked_again_before_signalling(self):
         import signal
         unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
@@ -883,7 +967,9 @@ class BridgeTests(unittest.TestCase):
 
     def test_attach_preserves_recorded_memory_mode(self):
         import shlex
-        self.fake("print(json.dumps({'type':'thread.started','thread_id':'memory-thread'}))\n"
+        capture = self.root / "attach-memory-argv.json"
+        self.fake("from pathlib import Path\nPath(" + repr(str(capture)) + ").write_text(json.dumps(sys.argv),encoding='utf-8')\n"
+                  "print(json.dumps({'type':'thread.started','thread_id':'memory-thread'}))\n"
                   "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))")
         for mode, review in (("off", None), ("scoped", ["--uncommitted"]), ("on", None)):
             b.save({**b.load(), "codex_memory": mode})
@@ -894,7 +980,12 @@ class BridgeTests(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 b.cmd_attach(argparse.Namespace(job=r["jid"], name=None, force=False))
-            argv = shlex.split(out.getvalue())
+            if os.name == "nt":
+                result = self.shell_command(out.getvalue(), cwd=self.cwd, env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = json.loads(capture.read_text(encoding="utf-8"))
+            else:
+                argv = shlex.split(out.getvalue())
             self.assertEqual("memories.use_memories=false" in argv, mode != "on")
             self.assertEqual("memories.generate_memories=false" in argv, mode == "off")
             self.assertIn("memory-thread", argv)
@@ -982,7 +1073,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_background_start_reminds_to_open_live_view(self):
         self.fake("import json\nprint(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'ok'}}))\n")
-        result = subprocess.run([str(SCRIPT), "run", "--background", "--role", "explorer", "--cd", str(self.cwd), "hello"],
+        result = subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT), "run", "--background", "--role", "explorer", "--cd", str(self.cwd), "hello"],
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("watch live", result.stdout)
@@ -997,7 +1088,7 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("ToolSearch", prompt.split("---", 2)[1])
 
     def bridge_cli(self, *args, **kw):
-        return subprocess.run([sys.executable, str(SCRIPT)] + list(args), cwd=self.cwd,
+        return subprocess.run([sys.executable, "-X", "utf8", str(SCRIPT)] + list(args), cwd=self.cwd,
                               env=self.env, capture_output=True, text=True, timeout=15, **kw)
 
     def await_state(self, jid, predicate):
@@ -1019,7 +1110,7 @@ class BridgeTests(unittest.TestCase):
                   " print(json.dumps({'type':'thread.started','thread_id':'steer-thread'}))\n"
                   " print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'steered-ok'}}))\n"
                   "else:\n"
-                  " child=subprocess.Popen(['sleep','7319'],start_new_session=True)\n"
+                  " child=subprocess.Popen([sys.executable,'-X','utf8','-c','import time; time.sleep(7319)'],start_new_session=True)\n"
                   " Path(" + repr(str(self.ready)) + ").write_text(str(child.pid))\n"
                   " print(json.dumps({'type':'thread.started','thread_id':'steer-thread'}),flush=True)\n"
                   " time.sleep(60)\n")
@@ -1039,7 +1130,7 @@ class BridgeTests(unittest.TestCase):
         state = self.await_state(old, lambda st: st.get("thread"))
         self.wait_ready()
         child = int(self.ready.read_text())
-        self.addCleanup(lambda: subprocess.run(["kill", str(child)], capture_output=True))
+        self.addCleanup(self.cleanup_pid, child)
         b.save({**b.load(), "codex_memory": "on", "sandbox": "read-only", "model": "gpt-6-luna", "effort": "low"})
         guidance = "Keep completed steps.\nOnly change the final answer.\n"
         result = self.bridge_cli("steer", "--name", "steer-label", "-", input=guidance)
@@ -1101,17 +1192,17 @@ class BridgeTests(unittest.TestCase):
         script = self.root / "legacy" / "codex_bridge.py"
         script.parent.mkdir(exist_ok=True)
         ready = self.root / (jid + "-ready")
-        script.write_text("import subprocess,time\nfrom pathlib import Path\n"
-                          "child=subprocess.Popen(['sleep','7319'],start_new_session=True)\n"
+        script.write_text("import subprocess,sys,time\nfrom pathlib import Path\n"
+                          "child=subprocess.Popen([sys.executable,'-X','utf8','-c','import time; time.sleep(7319)'],start_new_session=True)\n"
                           "Path(" + repr(str(ready)) + ").write_text(str(child.pid))\n"
                           "time.sleep(60)\n")
-        proc = subprocess.Popen([sys.executable, str(script), "_job", jid], start_new_session=True)
+        proc = subprocess.Popen([sys.executable, "-X", "utf8", str(script), "_job", jid], start_new_session=True)
         def cleanup():
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=3)
             if ready.exists():
-                subprocess.run(["kill", ready.read_text()], capture_output=True)
+                self.cleanup_pid(int(ready.read_text()))
         self.addCleanup(cleanup)
         self.ready = ready
         self.wait_ready()
@@ -1139,7 +1230,7 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(b._jread(new)["status"], "done")
 
     def test_s2_unverifiable_and_gone_legacy_pid(self):
-        proc = subprocess.Popen(["sleep", "7319"], start_new_session=True)
+        proc = subprocess.Popen([sys.executable, "-X", "utf8", "-c", "import time; time.sleep(7319)"], start_new_session=True)
         self.addCleanup(lambda: proc.wait(timeout=3))
         self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
         old = b.new_run("task", self.cfg(), "hi", str(self.cwd))
@@ -1148,7 +1239,7 @@ class BridgeTests(unittest.TestCase):
             st.update(pid=proc.pid, thread="legacy-thread")
         for command in (lambda: b.cmd_cancel(argparse.Namespace(job=old)),
                         lambda: b.cmd_steer(argparse.Namespace(job=old, name=None, foreground=True, message="hi"))):
-            with self.assertRaisesRegex(SystemExit, "manual command: kill " + str(proc.pid)):
+            with self.assertRaisesRegex(SystemExit, "manual command: " + ("Stop-Process -Id " if os.name == "nt" else "kill ") + str(proc.pid)):
                 command()
             self.assertIsNone(proc.poll())
             self.assertEqual(b._jread(old)["status"], "running")
@@ -1158,7 +1249,7 @@ class BridgeTests(unittest.TestCase):
             b.cmd_cancel(argparse.Namespace(job=old))
         self.assertEqual(b._jread(old)["status"], "failed")
         self.assertEqual(b._jread(old)["error"], "worker process gone (legacy job)")
-        self.assertIn("kill " + str(proc.pid), err.getvalue())
+        self.assertIn(("Stop-Process -Id " if os.name == "nt" else "kill ") + str(proc.pid), err.getvalue())
 
     def test_s3_steering_docs_and_help(self):
         doc = (SCRIPT.parents[1] / "commands" / "run.md").read_text()

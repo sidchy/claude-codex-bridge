@@ -19,11 +19,43 @@ Claude 会先判断任务难度，选好 Codex 的模型和强度，开跑，并
 
 重启 Claude Code，输入 `/`，应该能看到 `/codex:run` 和 `/codex:config`。
 
-需要本机装好 Codex CLI 并登录（`npm i -g @openai/codex@latest`），Python 3.9 或更高版本，不需要 pip 安装任何东西。目前只在 macOS 上测过。实时观看面板需要 Claude 桌面端，纯终端里 Claude 会把进展转述给你。
+需要本机装好 Codex CLI 并登录（`npm i -g @openai/codex@latest`），Python 3.9 或更高版本（原生 Windows 使用 CPython 3.10 或更高版本），不需要 pip 安装任何东西。实时观看面板需要 Claude 桌面端，纯终端里 Claude 会把进展转述给你。
 
 不想安装想先试试：克隆本仓库，运行 `claude --plugin-dir ./claude-codex-bridge/codex`。
 
 如果你装了 OpenAI 官方的 `codex` 插件，两者都会注册 `/codex:*`，请禁用其中一个。
+
+## Windows
+
+支持在 PowerShell 和 Git Bash 中使用原生 Windows 11，无需 WSL。Windows 文件锁、进程查询与清理、管道流式读写均使用 Python 标准库和 Windows API。无需 pip 包、管理员权限、开发者模式或符号链接权限。请显式指定 Python 解释器并加上 `-X utf8`，不要依赖 shebang、`.py` 文件关联或 `python3` 别名。
+
+在仓库目录中使用 PowerShell（请替换为自己的安装路径）：
+
+```powershell
+python -X utf8 .\codex\scripts\codex_bridge.py --help
+python -X utf8 .\codex\scripts\codex_bridge.py config show
+$env:CODEX_BRIDGE_HOME = 'C:\Users\you\Bridge Data'
+& 'C:\Program Files\Python310\python.exe' -X utf8 'C:\src\claude-codex-bridge\codex\scripts\codex_bridge.py' jobs
+```
+
+在 Git Bash 中，显式使用原生 Windows Python：
+
+```bash
+python -X utf8 './codex/scripts/codex_bridge.py' --help
+CODEX_BRIDGE_HOME='C:/Users/you/Bridge Data' python -X utf8 './codex/scripts/codex_bridge.py' config show
+```
+
+Windows 下打印的 watch/log/cancel/attach 命令采用 PowerShell 语法，并使用当前解释器的完整路径。请粘贴到 PowerShell；在 Git Bash 中，使用 `python -X utf8 '<脚本路径>'` 加相同参数，并按需使用 Bash 的环境变量前缀。PowerShell 使用 `&` 调用带引号的可执行文件路径，使用 `$env:CODEX_BRIDGE_HOME = '...'` 设置自定义目录。Attach 使用 `Set-Location -LiteralPath '...'; & ...`，也兼容 Windows PowerShell 5.1。建议用 JSON 数组设置 `extra_args`，以保留空格和反斜杠，例如 `extra_args=["--add-dir","C:\\work\\project"]`。
+
+打印的 attach 命令可能使用 Python 包装调用，以保留参数中的引号。请原样复制完整命令。
+
+PowerShell 5.1 向原生程序传递参数时可能移除内嵌的双引号。设置结构化参数时，请使用停止解析标记和转义引号（在仓库目录中运行）：
+
+```powershell
+python -X utf8 .\codex\scripts\codex_bridge.py --% config set "extra_args=[\"--add-dir\",\"C:/work/project\"]"
+```
+
+其他位置的单引号 JSON 示例使用 Unix/Git Bash 引号规则。从 Bash 工具调用时，请通过 `powershell.exe -NoProfile -Command '<完整命令>'` 执行生成的 PowerShell 命令，并按需转义外层 Bash 引号。
 
 ## 用法
 
@@ -138,7 +170,7 @@ Codex 默认以 `danger-full-access` 和审批策略 `never` 运行，也就是�
 
 ## 脚本
 
-插件只是 `codex/scripts/codex_bridge.py` 外面的一层薄壳，你也可以直接调用它。它会刷新一个稳定的符号链接 `~/.claude/codex-bridge/bin/codex_bridge.py`。
+插件只是 `codex/scripts/codex_bridge.py` 外面的一层薄壳，在 Unix 上可以直接调用，在 Windows 上通过 Python 调用。它会刷新稳定的启动器 `~/.claude/codex-bridge/bin/codex_bridge.py`：Unix 上为符号链接，Windows 上为普通 Python 包装脚本。
 
 ```text
 run [--name L] [--role R] [--model M] [--effort E] [--sandbox S] [--cd DIR] [--background] [--continue] -
@@ -169,6 +201,12 @@ zsh 报 `exit 127`：直接调用脚本并给路径加引号。别写成 `python
 
 ```bash
 python3 -m unittest discover -s codex/tests -v
+```
+
+Windows 下（PowerShell 或 Git Bash）：
+
+```text
+python -X utf8 -m unittest discover -s codex/tests -v
 ```
 
 测试全部离线，不调用任何模型。

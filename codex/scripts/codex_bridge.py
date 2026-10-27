@@ -24,10 +24,78 @@ Persistent settings: ~/.claude/codex-bridge/settings.json
 Per-call flags override them: --model --effort --sandbox --cd --add-dir --timeout --profile
 """
 import argparse, glob, json, os, shutil, subprocess, sys, tempfile
-import contextlib, fcntl, re, signal, time, hashlib, shlex, selectors, math
+import contextlib, re, signal, time, hashlib, shlex, selectors, math
+if os.name == "nt":
+    import importlib.util
+    import queue, threading, msvcrt
+else:
+    import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import deque
+
+if os.name == "nt":
+    _spec = importlib.util.spec_from_file_location("_codex_bridge_windows", Path(__file__).with_name("_windows.py"))
+    win = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(win)
+    for _stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", **({"newline": ""} if _stream is not sys.stdin else {}))
+
+
+def replace_file(source, destination):
+    """Windows readers/virus scanners can temporarily deny delete sharing."""
+    if os.name != "nt":
+        return os.replace(source, destination)
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            return os.replace(source, destination)
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def read_owned(path, newline=None):
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            with open(path, encoding="utf-8", newline=newline) as source:
+                return source.read()
+        except PermissionError:
+            if os.name != "nt" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def cli_command(binary, *args):
+    if os.name == "nt" and str(binary).lower().endswith(".py"):
+        return [sys.executable, "-X", "utf8", str(binary), *args]
+    return [binary, *args]
+
+
+def launch_options(suspended=False):
+    return {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP | (4 if suspended else 0)} if os.name == "nt" else {"start_new_session": True}
+
+
+def write_report(path, text):
+    with open(path, "w", encoding="utf-8", newline="") as stream:
+        stream.write(text)
+
+
+def powershell_command(argv):
+    # Windows PowerShell 5.1 strips embedded double quotes when forwarding to
+    # native programs. Pass such argv through Python's lossless subprocess API;
+    # the transport code and payload contain no double quotes themselves. This
+    # also works with PowerShell 7's different native argument passing modes.
+    if any('"' in str(arg) or "\n" in str(arg) or "\r" in str(arg) for arg in argv):
+        import base64
+        payload = base64.b64encode(json.dumps(list(argv), ensure_ascii=True).encode("ascii")).decode("ascii")
+        code = "import base64,json,subprocess;raise SystemExit(subprocess.call(json.loads(base64.b64decode('" + payload + "'))))"
+        argv = [sys.executable, "-X", "utf8", "-c", code]
+    return "& " + " ".join("'" + str(arg).replace("'", "''") + "'" for arg in argv)
+
 
 BRIDGE_HOME = os.path.realpath(os.path.expanduser(os.environ.get("CODEX_BRIDGE_HOME", "~/.claude/codex-bridge")))
 SETTINGS = os.path.join(BRIDGE_HOME, "settings.json")
@@ -72,27 +140,46 @@ SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 @contextlib.contextmanager
 def file_lock(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+    with open(path, "a", encoding="utf-8") as lock:
+        if os.name != "nt":
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+            return
+        lock.seek(0, os.SEEK_END)
+        if not lock.tell():
+            lock.write("0")
+            lock.flush()
+        while True:
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as exc:
+                if exc.errno not in (13, 36):
+                    raise
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def atomic_json(path, value):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".bridge-")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     finally:
         Path(tmp).unlink(missing_ok=True)
 
 
 def _load_settings():
     try:
-        with open(SETTINGS) as f:
-            stored = json.load(f)
+        stored = json.loads(read_owned(SETTINGS))
         if not isinstance(stored, dict):
             raise ValueError("expected a JSON object")
     except FileNotFoundError:
@@ -179,7 +266,7 @@ def validate(k, v):
     elif k == "extra_args":
         if isinstance(v, str):
             try:
-                v = json.loads(v) if v.lstrip().startswith("[") else shlex.split(v)
+                v = json.loads(v) if v.lstrip().startswith("[") else (win.split_args(v) if os.name == "nt" else shlex.split(v))
             except ValueError as exc:
                 fail(f"expected JSON array or shell argument string: {exc}")
         if not isinstance(v, list) or any(not isinstance(arg, str) for arg in v):
@@ -194,7 +281,7 @@ GUI_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/C
 
 def _ver(b):
     try:
-        out = subprocess.run([b, "--version"], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(cli_command(b, "--version"), capture_output=True, text=True, timeout=10, encoding="utf-8").stdout
         return tuple(int(x) for x in out.split()[-1].split("."))
     except Exception:
         return (0,)
@@ -223,7 +310,7 @@ def cmd_config(a):
             except SystemExit:
                 backup = SETTINGS + ".corrupt-" + str(time.time_ns())
                 try:
-                    os.replace(SETTINGS, backup)
+                    replace_file(SETTINGS, backup)
                 except OSError as exc:
                     sys.exit(f"cannot back up corrupt settings {SETTINGS}: {exc}")
             s = dict(DEFAULTS)
@@ -231,7 +318,7 @@ def cmd_config(a):
                 atomic_json(SETTINGS, s)
             except OSError:
                 if backup:
-                    os.replace(backup, SETTINGS)
+                    replace_file(backup, SETTINGS)
                 raise
             if backup:
                 print(f"preserved corrupt settings: {backup}", file=sys.stderr)
@@ -257,7 +344,7 @@ def model_catalog(cfg=None, cwd=None):
     context = {"profile": profile, "extra_args": extra,
                "cwd": os.path.realpath(cwd or os.getcwd()),
                "codex_home": os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))}
-    command = [binary] + (["-p", profile] if profile else []) + ["debug", "models"]
+    command = cli_command(binary) + (["-p", profile] if profile else []) + ["debug", "models"]
     # Only config overrides apply to catalog lookup; exec-only arguments (e.g.
     # --add-dir) still participate in the cache key and custom-model exception.
     for index, arg in enumerate(extra):
@@ -268,13 +355,13 @@ def model_catalog(cfg=None, cwd=None):
     path = os.path.join(BRIDGE_HOME, "models.json")
     with file_lock(path + ".lock"):
         try:
-            cached = json.loads(Path(path).read_text())
+            cached = json.loads(read_owned(path))
             if cached.get("binary") == binary and cached.get("context") == context and 0 <= time.time() - cached["fetched"] < 3600:
                 return cached["models"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
         try:
-            out = subprocess.run(command, cwd=context["cwd"], capture_output=True, text=True, timeout=30)
+            out = subprocess.run(command, cwd=context["cwd"], capture_output=True, text=True, timeout=30, encoding="utf-8")
             if out.returncode:
                 raise ValueError(out.stderr.strip() or f"exit {out.returncode}")
             models = [{k: m.get(k) for k in ("slug", "visibility", "default_reasoning_level", "supported_reasoning_levels")}
@@ -292,7 +379,7 @@ def custom_model_context(cfg, settings):
         return True
     native = Path(os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))) / "config.toml"
     try:
-        text = native.read_text()
+        text = native.read_text(encoding="utf-8")
     except OSError:
         return False
     try:
@@ -343,7 +430,7 @@ def cmd_status(a):
     if getattr(a, "json", False) or getattr(a, "job", "last") != "last" or getattr(a, "name", None):
         print(json.dumps(compact_state(_refresh(_resolve_job(a.job, a.name))), separators=(",", ":")))
         return
-    print(subprocess.run([codex_bin(), "--version"], capture_output=True, text=True).stdout.strip())
+    print(subprocess.run(cli_command(codex_bin(), "--version"), capture_output=True, text=True, encoding="utf-8").stdout.strip())
     print("settings file:", SETTINGS)
     print(json.dumps(load(), indent=2, ensure_ascii=False))
 
@@ -397,7 +484,7 @@ HASH_BYTE_LIMIT = 32 * 1024 * 1024
 def _gitstate(cd, include=()):
     try:
         root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cd,
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20, encoding="utf-8")
         if root.returncode:
             return None
         out = subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
@@ -448,9 +535,10 @@ def memory_workspaces():
             for line in source:
                 m = re.match(r"\s*applies_to:\s*cwd=([^;]+)", line)
                 if m:
-                    for item in re.split(r",\s*(?=/)", m.group(1)):
+                    separator = r",\s*(?=[A-Za-z]:[/\\]|[/\\]{2}|/)" if os.name == "nt" else r",\s*(?=/)"
+                    for item in re.split(separator, m.group(1)):
                         item = item.strip()
-                        if not item.startswith("/") or "{" in item or "}" in item or "\x00" in item:  # skip brace patterns / junk
+                        if not (os.path.isabs(item) if os.name == "nt" else item.startswith("/")) or "{" in item or "}" in item or "\x00" in item:  # skip brace patterns / junk
                             continue
                         try:
                             item = os.path.realpath(item)
@@ -471,10 +559,10 @@ def memory_scope(cdir, known=None):
     root, main = None, None
     try:
         top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cdir,
-                             capture_output=True, text=True, timeout=3, check=True)
+                             capture_output=True, text=True, timeout=3, check=True, encoding="utf-8")
         root = os.path.realpath(top.stdout.strip())
         common = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=cdir,
-                                capture_output=True, text=True, timeout=3, check=True)
+                                capture_output=True, text=True, timeout=3, check=True, encoding="utf-8")
         common = os.path.realpath(os.path.join(cdir, common.stdout.strip()))
         if os.path.basename(common) == ".git":
             main = os.path.dirname(common)
@@ -656,6 +744,11 @@ INTERNAL_NOTICES = (
 
 
 def shell_text(command):
+    if os.name == "nt":
+        match = re.search(r"(?i)(?:^|[\\/])(powershell|pwsh)(?:\.exe)?(?:['\"])?\s+.*?-(?:Command|c)\s+(.+)$", command)
+        if match:
+            text = match.group(2).strip()
+            return text[1:-1] if text[:1] in ("'", '\"') and text[-1:] == text[:1] else text
     try:
         words = shlex.split(command)
         if len(words) >= 3 and os.path.basename(words[0]) in ("sh", "bash", "zsh") and words[1] in ("-c", "-lc"):
@@ -667,6 +760,15 @@ def shell_text(command):
 
 def step_kind(command):
     text = shell_text(command)
+    if os.name == "nt":
+        if re.search(r"(?i)\bpython(?:[\d.]*|w)?(?:\.exe)?['\"]?\s+(?:-X\s+\S+\s+|-u\s+)*-m\s+(?:unittest|pytest)\b", text):
+            return "test"
+        if re.search(r"(?i)\b(?:Set-Content|Add-Content|Out-File|New-Item|Remove-Item|Move-Item|Copy-Item)\b", text):
+            return "edit"
+        if re.search(r"(?i)\b(?:Get-Content|Get-ChildItem|Get-Item)\b", text):
+            return "read"
+        if re.search(r"(?i)\bSelect-String\b", text):
+            return "search"
     if re.search(r"\bpython[\d.]*\s+-m\s+(?:unittest|pytest)\b|(?:^|[\n;&|])\s*(?:\S*/)?pytest\b|\bunittest\.main\(|\b(npm|pnpm|yarn|cargo|go|make)\s+test\b", text):
         return "test"
     if re.search(r"apply_patch|\b(cat|tee|echo)\b[^\n]*>|\btee\s+\S+|\bsed\s+-i|\bgit\s+(add|mv|rm)\b|\.write(?:_(?:text|bytes))?\(|\bopen\([^\n]*,\s*(?:mode\s*=\s*)?[\"'][wa]|\bperl\s+-[^\s]*i", text):
@@ -742,7 +844,7 @@ def trace_label(command):
     if description.startswith("script "):
         return description.split(" writes ", 1)[-1] if " writes " in description else description
     try:
-        words = shlex.split(shell_text(command))
+        words = win.split_args(shell_text(command)) if os.name == "nt" else shlex.split(shell_text(command))
         return next((w for w in reversed(words) if not w.startswith("-") and w not in ("cat", "ls")), "-")
     except ValueError:
         return step_description(command)
@@ -755,7 +857,7 @@ def compact_trace(jid):
     rows, commands, notices = [], {}, {}
     path = Path(_job_path(jid, "events.jsonl"))
     if path.exists():
-        with path.open() as stream:
+        with path.open(encoding="utf-8") as stream:
             for line in stream:
                 try:
                     ev = json.loads(line)
@@ -975,7 +1077,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     _jwrite(jid, codex_memory=memory, native_review=review is not None)
     if memory == "scoped" and prompt:
         prompt = memory_guard(cdir) + "\n\n" + prompt
-    cmd = [codex_bin()]
+    cmd = cli_command(codex_bin())
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as output_file:
         out = output_file.name
     if cfg["profile"]:  # --profile is a top-level option; exec/review/resume reject it
@@ -1003,6 +1105,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
            "jid": jid, "digest": ""}
     before = _gitstate(cdir)
     p = None
+    windows_job = None
     timed_out, cleanup_errors = [], []
     msgs, errors, cmds, failed = [], [], 0, 0
     subagent_ids, subagent_meta = set(), {}
@@ -1015,7 +1118,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     turn_completed = False
 
     try:
-        with open(_job_path(jid, "events.jsonl"), "a", buffering=1) as evf:
+        with open(_job_path(jid, "events.jsonl"), "a", buffering=1, encoding="utf-8") as evf:
             # Publish the child group under the same lock used by cancel. A cancellation
             # before launch must prevent the child from ever being started.
             with job_state(jid) as st:
@@ -1023,7 +1126,11 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                     raise RuntimeError("job was cancelled before launch")
                 p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, cwd=cdir, bufsize=0,
-                                     start_new_session=True)
+                                     **launch_options(suspended=True))
+                if os.name == "nt":
+                    job_name = "Local\\codex-bridge-" + hashlib.sha256((BRIDGE_HOME + jid).encode("utf-8")).hexdigest()
+                    windows_job = win.contain(p, job_name)
+                    st["windows_job"] = job_name
                 snapshot = process_snapshot()
                 identity = snapshot[p.pid][3] if snapshot is not None and p.pid in snapshot else None
                 st.update(child_pid=p.pid, pgid=p.pid, child_identity=identity)
@@ -1081,7 +1188,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                     for ln in render_event(ev):
                         print(ln, file=sys.stderr, flush=True)
             p.wait(timeout=REAP_TIMEOUT)
-            with Path(out).open(newline="") as stream:
+            with Path(out).open(newline="", encoding="utf-8") as stream:
                 final = stream.read()
     except subprocess.TimeoutExpired:
         timed_out.append(True)
@@ -1102,6 +1209,8 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
             for pipe in (p.stdin, p.stdout):
                 if pipe:
                     pipe.close()
+        if windows_job is not None:
+            win.close(windows_job)
         Path(out).unlink(missing_ok=True)
     res["exit_code"] = p.returncode if p else None
     res["text"] = final or (msgs[-1] if msgs else "")
@@ -1196,6 +1305,11 @@ def header(cfg, role=None):
 
 
 def bridge_command(*args):
+    if os.name == "nt":
+        command = powershell_command([sys.executable, "-X", "utf8", os.path.join(BRIDGE_HOME, "bin", "codex_bridge.py"), *args])
+        if BRIDGE_HOME != os.path.realpath(os.path.expanduser("~/.claude/codex-bridge")):
+            command = "$env:CODEX_BRIDGE_HOME='" + BRIDGE_HOME.replace("'", "''") + "'; " + command
+        return command
     command = shlex.join([os.path.join(BRIDGE_HOME, "bin", "codex_bridge.py"), *args])
     default_home = os.path.realpath(os.path.expanduser("~/.claude/codex-bridge"))
     if BRIDGE_HOME != default_home:
@@ -1212,7 +1326,7 @@ def print_footer(r):
 def saved_report(jid):
     path = Path(_job_path(jid, "result.txt"))
     if path.exists():
-        with path.open(newline="") as stream:
+        with path.open(newline="", encoding="utf-8") as stream:
             return stream.read()
     return ""
 
@@ -1350,14 +1464,13 @@ def _job_path(jid, name):
 @contextlib.contextmanager
 def job_state(jid):
     path = _job_path(jid, "state.json")
-    with open(_job_path(jid, "state.lock"), "a") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    with file_lock(_job_path(jid, "state.lock")):
         st = _jread(jid) or {}
         yield st
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
 
 
 def _jwrite(jid, **kw):
@@ -1366,9 +1479,14 @@ def _jwrite(jid, **kw):
 
 
 def _jread(jid):
+    if jid is None:
+        return None
     try:
-        with open(_job_path(jid, "state.json")) as f:
-            return json.load(f)
+        return json.loads(read_owned(_job_path(jid, "state.json")))
+    except PermissionError:
+        if os.name == "nt":
+            raise  # a busy state file must never be mistaken for absent state
+        return None
     except (OSError, ValueError):
         return None
 
@@ -1384,10 +1502,12 @@ PIPE_DRAIN_TIMEOUT = 1.0
 
 def process_snapshot():
     """None means enumeration unavailable, not an empty process table."""
+    if os.name == "nt":
+        return win.snapshot()
     try:
         result = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
                                 capture_output=True, text=True, timeout=PS_TIMEOUT,
-                                env={**os.environ, "LC_ALL": "C"})
+                                env={**os.environ, "LC_ALL": "C"}, encoding="utf-8")
         if result.returncode:
             return None
         rows = {}
@@ -1402,6 +1522,8 @@ def process_snapshot():
 def _alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        return win.alive(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -1414,6 +1536,8 @@ def _alive(pid):
 def group_alive(pgid, snapshot=None):
     if not isinstance(pgid, int) or pgid <= 1:
         return False
+    if os.name == "nt":
+        return _alive(pgid)
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -1451,7 +1575,7 @@ def collect_descendants(root, tracked, snapshot, root_identity=None, owned_child
         tracked[root] = {"identity": row[3], "pgid": row[1]}
     while True:
         previous = len(tracked)
-        groups = {r["pgid"] for r in tracked.values() if r["pgid"] > 1 and r["pgid"] != os.getpgrp() and r["pgid"] != excluded_group}
+        groups = set() if os.name == "nt" else {r["pgid"] for r in tracked.values() if r["pgid"] > 1 and r["pgid"] != os.getpgrp() and r["pgid"] != excluded_group}
         for pid, (parent, group, status, identity) in snapshot.items():
             if pid != os.getpid() and pid != root and (parent in tracked or group in groups) and not status.startswith("Z"):
                 tracked[pid] = {"identity": identity, "pgid": group}
@@ -1489,6 +1613,8 @@ def targets_alive(tracked, snapshot, fallback_group=None):
     if any(_alive(pid) for pid in tracked):
         return True
     if fallback_group:
+        if os.name == "nt":
+            return _alive(fallback_group)
         try:
             os.killpg(fallback_group, 0)
             return True
@@ -1501,6 +1627,8 @@ def targets_alive(tracked, snapshot, fallback_group=None):
 
 def terminate_group(pgid, process=None, jid=None, legacy_root=None):
     """Bounded tree cleanup; verify identities before discovery and signalling."""
+    if os.name == "nt":
+        return terminate_windows(pgid, process, jid, legacy_root)
     if legacy_root is None and (not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp()):
         raise OSError(f"unsafe or missing process group: {pgid}")
     st = (_jread(jid) or {}) if jid else {}
@@ -1577,8 +1705,185 @@ def terminate_group(pgid, process=None, jid=None, legacy_root=None):
                   (": " + "; ".join(failures[-3:]) if failures else ""))
 
 
+def terminate_windows(pgid, process=None, jid=None, legacy_root=None):
+    root = legacy_root[0] if legacy_root else pgid
+    if not isinstance(root, int) or root <= 1 or root == os.getpid():
+        raise OSError(f"unsafe or missing process id: {root}")
+    state = (_jread(jid) or {}) if jid else {}
+    expected = legacy_root[1] if legacy_root else state.get("child_identity")
+    tracked = recorded_processes(state)
+    deadline = time.monotonic() + 5.0
+    suspended = {}
+    job_name = state.get("windows_job")
+    if job_name:
+        # A named Job Object retains kernel ownership even if the root exits or
+        # Toolhelp/creation-time queries fail. No numeric PID authorizes this kill.
+        win.kill_job(job_name)
+        while win.job_members(job_name):
+            if time.monotonic() >= deadline:
+                raise OSError("Windows job cleanup exceeded deadline")
+            if process is not None:
+                process.poll()
+            time.sleep(0.02)
+        remember_processes(jid, {}, process_snapshot())
+        return
+    try:
+        while True:
+            rows = process_snapshot()
+            if rows is None:
+                raise OSError("Windows process enumeration unavailable; cleanup unconfirmed")
+            row = rows.get(root)
+            if row and expected and row[3] != expected:
+                if jid:
+                    _jwrite(jid, child_identity_mismatch=True)
+                # Previously verified descendants are still ours; the reused root is not.
+                tracked.pop(root, None)
+            tracked = collect_descendants(root, tracked, rows, expected,
+                                           process is not None and process.poll() is None and not expected)
+            if not expected and root in tracked:
+                expected = tracked[root]["identity"]
+            remember_processes(jid, tracked, rows)
+            if not tracked:
+                if row and not expected:
+                    raise OSError("process identity unavailable; refusing unverified PID")
+                return
+            # Stop verified parents before discovering/killing children, so they cannot
+            # replace descendants during cleanup. Validation and action share a HANDLE.
+            for pid in sorted(tracked, key=lambda pid: pid != root):
+                identity = tracked[pid]["identity"]
+                if pid not in suspended and win.signal_verified(pid, identity, stop=True):
+                    suspended[pid] = identity
+            current = process_snapshot()
+            if current is None:
+                raise OSError("cannot verify suspended Windows process tree")
+            expanded = collect_descendants(root, tracked, current, expected)
+            if set(expanded) != set(tracked):
+                tracked = expanded
+                if time.monotonic() >= deadline:
+                    raise OSError("Windows process cleanup exceeded deadline")
+                continue
+            tracked = expanded
+            remember_processes(jid, tracked, current)
+            for pid in sorted(tracked, key=lambda pid: pid == root):
+                win.signal_verified(pid, tracked[pid]["identity"])
+            if process is not None:
+                process.poll()
+            if time.monotonic() >= deadline:
+                raise OSError("Windows process cleanup exceeded deadline")
+            time.sleep(0.02)
+    finally:
+        # If access failed, do not leave surviving owned processes suspended.
+        for pid, identity in suspended.items():
+            win.resume_verified(pid, identity)
+
+
+def windows_child_lines(process, prompt, timeout, jid):
+    events = queue.Queue(maxsize=64)
+    stopped = threading.Event()
+
+    def publish(value):
+        while not stopped.is_set():
+            try:
+                events.put(value, timeout=0.05)
+                return
+            except queue.Full:
+                pass
+
+    def read_output():
+        try:
+            while not stopped.is_set():
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                publish(chunk)
+        except (OSError, ValueError) as exc:
+            publish(exc)
+        finally:
+            publish(None)
+
+    def write_input():
+        try:
+            pending = memoryview((prompt or "").encode("utf-8"))
+            while pending and not stopped.is_set():
+                count = process.stdin.write(pending[:65536])
+                if not count:
+                    break
+                pending = pending[count:]
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    writer = threading.Thread(target=write_input, daemon=True)
+    reader.start()
+    writer.start()
+    deadline = time.monotonic() + timeout
+    drain = cancel = None
+    next_scan = 0
+    tracked = {}
+    identity = (_jread(jid) or {}).get("child_identity")
+    buffer = b""
+    eof = False
+    try:
+        while not eof or process.poll() is None:
+            now = time.monotonic()
+            if now >= deadline:
+                raise subprocess.TimeoutExpired("codex", timeout)
+            if now >= next_scan:
+                rows = process_snapshot()
+                if rows is not None:
+                    for pid in win.job_members((_jread(jid) or {}).get("windows_job")):
+                        if pid in rows:
+                            tracked[pid] = {"identity": rows[pid][3], "pgid": 0}
+                tracked = collect_descendants(process.pid, tracked, rows, identity, process.poll() is None)
+                if not identity and process.pid in tracked:
+                    identity = tracked[process.pid]["identity"]
+                remember_processes(jid, tracked, rows)
+                next_scan = time.monotonic() + 0.5
+            if (_jread(jid) or {}).get("status") in ("cancelling", "cancelled", "steered"):
+                cancel = cancel or now + 2 * CANCEL_GRACE + 2 * PS_TIMEOUT + REAP_TIMEOUT
+                if now >= cancel:
+                    raise RuntimeError("cancelled job exceeded its pipe/exit deadline")
+            if process.poll() is not None and not eof:
+                drain = drain or now + PIPE_DRAIN_TIMEOUT
+                if now >= drain:
+                    raise RuntimeError("codex exited but a descendant kept stdout open")
+            try:
+                chunk = events.get(timeout=min(0.05, max(0, deadline - now)))
+            except queue.Empty:
+                continue
+            if isinstance(chunk, Exception):
+                raise chunk
+            if chunk is None:
+                eof = True
+                if buffer:
+                    yield buffer.decode("utf-8", errors="replace")
+                    buffer = b""
+                continue
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                yield line.decode("utf-8", errors="replace")
+    finally:
+        stopped.set()
+        # Cancel pending synchronous reads/writes before the caller closes pipes;
+        # otherwise CloseHandle can wait for a live child even after the deadline.
+        for thread in (reader, writer):
+            if thread.is_alive():
+                win.cancel_io(thread.native_id)
+        for thread in (reader, writer):
+            thread.join(timeout=0.2)
+
+
 def child_lines(process, prompt, timeout, jid):
     """Nonblocking pipes: neither partial stdout nor unread stdin can defeat a deadline."""
+    if os.name == "nt":
+        yield from windows_child_lines(process, prompt, timeout, jid)
+        return
     deadline = time.monotonic() + timeout
     drain_deadline = cancel_deadline = None
     next_scan = 0
@@ -1646,7 +1951,7 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     os.makedirs(os.path.join(JOBS, jid))
     if spec:
-        Path(_job_path(jid, "spec.json")).write_text(json.dumps(spec, ensure_ascii=False))
+        Path(_job_path(jid, "spec.json")).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.realpath(cd), model=cfg["model"], effort=cfg["effort"],
             started=time.time(), pid=os.getpid(), pgid=None, name=name, sandbox=cfg["sandbox"], profile=cfg["profile"],
             codex_memory=cfg.get("session_memory", load().get("codex_memory", "scoped")), native_review=review is not None,
@@ -1668,11 +1973,11 @@ def finish_run(r):
                       cleanup_error=r["cleanup_error"], error=r["error"],
                       timed_out=r.get("timed_out", False), usage=r["usage"])
             st.pop("finished", None)
-            Path(_job_path(r["jid"], "result.txt")).write_text(r.get("text", ""))
+            write_report(_job_path(r["jid"], "result.txt"), r.get("text", ""))
             return
         if st.get("status") in ("cancelling", "cleanup_pending"):
             return
-        Path(_job_path(r["jid"], "result.txt")).write_text(r["text"])
+        write_report(_job_path(r["jid"], "result.txt"), r["text"])
         st.update(status="done" if r["ok"] else "failed", usage=r["usage"],
                   error=r["error"], timed_out=r.get("timed_out", False), finished=time.time())
 
@@ -1689,11 +1994,14 @@ def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, r
             if st.get("status") != "running":
                 print(f"job {jid} is {st.get('status')}; worker was not launched")
                 return
-            with open(_job_path(jid, "log.txt"), "w") as log:
-                pr = subprocess.Popen([sys.executable, os.path.realpath(__file__), "_job", jid],
-                                      stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
+            with open(_job_path(jid, "log.txt"), "w", encoding="utf-8") as log:
+                pr = subprocess.Popen([sys.executable, "-X", "utf8", os.path.realpath(__file__), "_job", jid],
+                                      stdout=log, stderr=log, stdin=subprocess.DEVNULL, **launch_options(),
                                       env={**os.environ, "CODEX_BRIDGE_HOME": BRIDGE_HOME})
             st["pid"] = pr.pid
+            if os.name == "nt":
+                rows = process_snapshot()
+                st["worker_identity"] = rows[pr.pid][3] if rows is not None and pr.pid in rows else None
     except OSError as exc:
         finish_run({"jid": jid, "ok": False, "text": "", "error": f"cannot launch worker: {exc}", "usage": None})
         sys.exit(f"cannot launch worker: {exc}")
@@ -1709,7 +2017,7 @@ def start_job(kind, cfg, prompt, cd, add_dir=None, resume=False, session=None, r
 def cmd__job(a):
     jid = a.jid
     try:
-        spec = json.loads(Path(_job_path(jid, "spec.json")).read_text())
+        spec = json.loads(read_owned(_job_path(jid, "spec.json")))
         r = exec_codex(spec["cfg"], spec["prompt"], spec["cd"], spec["add_dir"], spec["session"],
                        spec["resume"], spec["review"], jid=jid)
     except (Exception, SystemExit) as exc:
@@ -1761,6 +2069,8 @@ def _refresh(jid):
         if st.get("status") in ACTIVE:
             snapshot = process_snapshot()
             worker_alive = (st.get("pid") in snapshot and not snapshot[st["pid"]][2].startswith("Z")) if snapshot is not None else _alive(st.get("pid"))
+            if os.name == "nt" and worker_alive and st.get("worker_identity"):
+                worker_alive = win.alive(st["pid"], st["worker_identity"])
             worker_alive = worker_alive and not st.get("worker_finished")
             tracked = recorded_processes(st)
             root, identity = st.get("child_pid"), st.get("child_identity")
@@ -1786,7 +2096,7 @@ def _refresh(jid):
                         st["error"] = "steering interrupted before replacement job was reserved"
                     st.update(status=target, finished=time.time())
                     if target == "failed":
-                        Path(_job_path(jid, "result.txt")).write_text("FAILED: " + st.get("error", "cleanup completed"))
+                        Path(_job_path(jid, "result.txt")).write_text("FAILED: " + st.get("error", "cleanup completed"), encoding="utf-8")
                 else:
                     st.update(status="failed", error="worker process gone (legacy job)" if "pgid" not in st else "worker process died")
         return dict(st)
@@ -1845,7 +2155,7 @@ def cmd_wait(a):
 def legacy_process(jid, st):
     """Verify the legacy root without trusting a recycled numeric PID."""
     pid = st.get("pid")
-    manual = f"kill {pid}"
+    manual = f"Stop-Process -Id {pid} -Force" if os.name == "nt" else f"kill {pid}"
     before = process_snapshot()
     row = before.get(pid) if before is not None else None
     if (before is not None and (row is None or row[2].startswith("Z"))) or not _alive(pid):
@@ -1854,9 +2164,12 @@ def legacy_process(jid, st):
         print(f"worker process gone (legacy job); cannot verify pid {pid}; manual command: {manual}", file=sys.stderr)
         return None
     try:
-        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
-                                text=True, timeout=PS_TIMEOUT, check=True)
-        argv = shlex.split(result.stdout.strip())
+        if os.name == "nt":
+            argv = win.split_args(win.command_line(pid))
+        else:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
+                                    text=True, timeout=PS_TIMEOUT, check=True, encoding="utf-8")
+            argv = shlex.split(result.stdout.strip())
         worker = (any(os.path.basename(v) == "codex_bridge.py" for v in argv)
                   and any(argv[i:i+2] == ["_job", jid] for i in range(len(argv))))
         # A recorded direct Codex child is also eligible; never accept arbitrary
@@ -1987,7 +2300,7 @@ def _stream(jid, follow, full=False, since=0, tail=None):
     if follow:
         print(f"═ codex run {jid} · {st.get('model')} {st.get('effort')} · {st.get('cwd')}", flush=True)
     cursor = 0
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         if tail is not None:
             lines = deque(maxlen=tail)
             for index, line in enumerate(f, 1):
@@ -2039,7 +2352,7 @@ def targeted_log(jid, a):
     events, cursor = [], 0
     path = Path(_job_path(jid, "events.jsonl"))
     if path.exists():
-        with path.open() as source:
+        with path.open(encoding="utf-8") as source:
             for cursor, line in enumerate(source, 1):
                 if cursor <= since or not line.endswith("\n"):
                     continue
@@ -2094,7 +2407,7 @@ def cmd_attach(a):
         sys.exit(f"job {jid} is still {st['status']}; cancel/wait first, or use attach --force")
     if not st.get("thread"):
         sys.exit("no codex session id recorded yet for this run")
-    cmd = [codex_bin()]
+    cmd = cli_command(codex_bin())
     if st.get("profile"):
         cmd += ["-p", st["profile"]]
     cmd += ["resume", st["thread"]]
@@ -2110,7 +2423,10 @@ def cmd_attach(a):
     if memory is None:
         memory = load().get("codex_memory", "scoped")
     cmd += memory_flags(memory, native_review=st.get("native_review", False))
-    print(f"cd {shlex.quote(st['cwd'])} && {shlex.join(cmd)}")
+    if os.name == "nt":
+        print("Set-Location -LiteralPath '" + st["cwd"].replace("'", "''") + "'; " + powershell_command(cmd))
+    else:
+        print(f"cd {shlex.quote(st['cwd'])} && {shlex.join(cmd)}")
     print("# Run the line above in a terminal to continue this exact Codex session interactively (you drive).", file=sys.stderr)
 
 
@@ -2144,7 +2460,7 @@ def cmd_parallel(a):
     [{"name":"a","role":"explorer","prompt":"...","cd":"/path","model":..,"effort":..,"sandbox":..}]
     Tasks writing to the same files must not run in parallel."""
     from concurrent.futures import ThreadPoolExecutor
-    raw = sys.stdin.read() if a.file == "-" else Path(a.file).read_text()
+    raw = sys.stdin.read() if a.file == "-" else Path(a.file).read_text(encoding="utf-8")
     tasks = json.loads(raw)
     s = load()
 
@@ -2185,12 +2501,27 @@ def refresh_bridge_link():
     target = os.path.realpath(__file__)
     directory = os.path.join(BRIDGE_HOME, "bin")
     os.makedirs(directory, exist_ok=True)
+    if os.name == "nt":
+        launcher = os.path.join(directory, "codex_bridge.py")
+        # os.execv on Windows spawns a new process and exits the caller with 0, losing stdin, ordering and the exit code.
+        content = "import runpy\nrunpy.run_path(" + repr(target) + ", run_name='__main__')\n"
+        with file_lock(launcher + ".lock"):
+            if os.path.exists(launcher) and read_owned(launcher) == content:
+                return
+            fd, temporary = tempfile.mkstemp(dir=directory, prefix=".launcher-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+                    stream.write(content)
+                replace_file(temporary, launcher)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        return
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".link-")
     os.close(fd)
     os.unlink(tmp)
     try:
         os.symlink(target, tmp)
-        os.replace(tmp, os.path.join(directory, "codex_bridge.py"))
+        replace_file(tmp, os.path.join(directory, "codex_bridge.py"))
     finally:
         Path(tmp).unlink(missing_ok=True)
 

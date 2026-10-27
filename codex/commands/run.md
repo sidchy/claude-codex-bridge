@@ -1,11 +1,11 @@
 ---
 description: Codex 的唯一入口：交活、审查、看进度、取消、接管，直接说人话，其余全自动
 argument-hint: <说人话：做什么 / 审查 / "它在干嘛" / "停" / "我来接手"；不写则审查当前改动>
-allowed-tools: mcp__terminal__run_in_terminal, mcp__terminal__stop_terminal_tab, ToolSearch, Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Bash(~/.claude/codex-bridge/bin/codex_bridge.py:*), Bash(git:*), Bash(python3 -m unittest:*), Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
+allowed-tools: mcp__terminal__run_in_terminal, mcp__terminal__stop_terminal_tab, ToolSearch, Bash(${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py:*), Bash(~/.claude/codex-bridge/bin/codex_bridge.py:*), Bash(python:*), Bash(python.exe:*), Bash(py:*), Bash(powershell.exe:*), Bash(pwsh:*), Bash(git:*), Bash(python3 -m unittest:*), Read, Edit, Write, Grep, Glob, Agent, AskUserQuestion
 disable-model-invocation: true
 ---
 
-Handle $ARGUMENTS. Choose role/model/effort/sandbox, sub-agent dispatch and execution mode yourself; ask at most one question only if the goal is ambiguous. Invoke the executable directly, with its path quoted. Use this template, replacing the label, role, flags and brief as needed:
+Handle $ARGUMENTS. Choose role/model/effort/sandbox, sub-agent dispatch and execution mode yourself; ask at most one question only if the goal is ambiguous. On Unix invoke the executable directly, with its path quoted. Use this Unix template, replacing the label, role, flags and brief as needed (Windows instructions follow):
 
 ```sh
 "${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run --name task-label --role worker --subagents auto --background - <<'PROMPT'
@@ -17,7 +17,39 @@ Reply with: files changed and real check result, at most 10 lines.
 PROMPT
 ```
 
-Every invocation refreshes `~/.claude/codex-bridge/bin/codex_bridge.py`, a stable symlink to the script. Use that executable for subsequent commands below. Quote paths/arguments containing shell metacharacters or spaces; zsh requires correct quoting. Do not prefix the bridge with `python3`.
+Every invocation refreshes `~/.claude/codex-bridge/bin/codex_bridge.py`, a stable symlink on Unix and an unprivileged Python stub on Windows. Use that launcher for subsequent commands below. Quote paths/arguments containing shell metacharacters or spaces; zsh requires correct quoting. On Unix do not prefix the bridge with `python3`.
+
+## Windows invocation
+
+Native Windows 11 with CPython 3.10+ works in PowerShell and Git Bash without WSL, pip packages, administrator rights, or symlink privileges. Always invoke the bridge with Python and `-X utf8`; shebangs and `python3` aliases are not portable. The allowlist permits interpreter launches; use the installed interpreter path when `python` is unavailable.
+
+PowerShell (substitute the actual interpreter, plugin and project paths; a here-string passes the brief verbatim):
+
+```powershell
+$env:CODEX_BRIDGE_HOME = 'C:\Users\you\Bridge Data'
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+Goal: describe the task.
+Context: paths and known facts.
+Do / Don't touch: scope and constraints.
+Done when: exact check command.
+Reply with: files changed and real check result, at most 10 lines.
+'@ | & 'C:\Program Files\Python310\python.exe' -X utf8 'C:\plugins\codex\scripts\codex_bridge.py' run --name task-label --role worker --subagents auto --background --cd 'C:\src\project' -
+```
+
+Git Bash (native Windows Python):
+
+```bash
+CODEX_BRIDGE_HOME='C:/Users/you/Bridge Data' python -X utf8 "${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run --name task-label --role worker --subagents auto --background --cd 'C:/src/project' - <<'PROMPT'
+Goal: describe the task, with the same brief fields as above.
+PROMPT
+```
+
+Omit the home assignment to use the default. Windows-generated commands use PowerShell syntax with the current interpreter's full path (`& '<python.exe>' -X utf8 '<launcher.py>' watch <id>`). Run those commands in a PowerShell terminal; in Git Bash translate the interpreter invocation and any environment prefix as above. Preserve `$env:CODEX_BRIDGE_HOME = '...';` when printed. Attach uses `Set-Location -LiteralPath '...'; & ...`, including on Windows PowerShell 5.1. Never rewrite a Windows command to direct `.py` execution. Windows process/lock/pipe support uses the standard library and Windows APIs.
+
+Printed attach commands may use a Python wrapper to preserve quoted arguments across PowerShell versions. Copy the complete command verbatim; do not simplify or remove the wrapper.
+
+When using a Bash tool, execute generated PowerShell lines through `powershell.exe -NoProfile -Command '<complete command>'`, escaping the outer Bash quotes as needed.
 
 ## Mode and sessions
 - Empty request / review / check / second opinion: `review [--base REF|--commit SHA] [focus]`; `--adversarial` for a tough/risky review. No changes to review: say so and stop. Reviews always get fresh sessions.
@@ -45,7 +77,7 @@ Within one session NEVER switch model or effort (prompt cache); all resume paths
 ## Supervision and handoff
 - Work taking ~30s+ or open-ended: start `--background`, and in the SAME turn, right after the job id is printed, open the live view for the user. This is a required step, not an option; the user watches Codex work in the desktop app's terminal pane, and skipping it leaves them blind.
   1. If `mcp__terminal__run_in_terminal` is not callable, it is a deferred tool: load it first with ToolSearch, query `select:mcp__terminal__run_in_terminal`. Never conclude "no terminal tool" without trying this.
-  2. Call it with `command` = the printed `watch` line (normally `~/.claude/codex-bridge/bin/codex_bridge.py watch <id>`; one ASCII line, no `cwd`, `title` = a short label such as "Codex: <task>"). Open one tab per background job, every time, including when an earlier tab exists. With a custom bridge home, use the printed command with its `CODEX_BRIDGE_HOME=...` prefix.
+  2. Call it with `command` = the printed `watch` line (on Unix normally `~/.claude/codex-bridge/bin/codex_bridge.py watch <id>`; on Windows the explicit PowerShell interpreter command above; no `cwd`, `title` = a short label such as "Codex: <task>"). Use a terminal matching the printed shell syntax. Open one tab per background job, every time, including when an earlier tab exists. With a custom bridge home, preserve the printed home assignment (`CODEX_BRIDGE_HOME=...` on Unix, `$env:CODEX_BRIDGE_HOME = '...';` on Windows).
   3. When the job finishes, close that tab (`mcp__terminal__stop_terminal_tab` with `close: true`) so the pane does not pile up.
   4. Only if the tool truly does not exist or is denied: say so and give the user the exact `watch` command to run in their own terminal; then relay progress yourself with `status <id> --json`.
 - No terminal tool: poll `status <id> --json` for compact state, activity counts and exit code. Relay 1–2 plain lines at checkpoints, not raw logs.

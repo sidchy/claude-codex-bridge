@@ -19,11 +19,43 @@ Claude reads the request, decides how hard it is, picks a Codex model and effort
 
 Restart Claude Code and type `/`. You should see `/codex:run` and `/codex:config`.
 
-You need the Codex CLI on your `PATH` (logged in, `npm i -g @openai/codex@latest`) and Python 3.9 or newer. There is nothing to pip install. It has only been tested on macOS. The live watch pane needs the Claude desktop app; in the plain terminal, Claude relays progress instead.
+You need the Codex CLI on your `PATH` (logged in, `npm i -g @openai/codex@latest`) and Python 3.9 or newer (native Windows: CPython 3.10 or newer). There is nothing to pip install. The live watch pane needs the Claude desktop app; in the plain terminal, Claude relays progress instead.
 
 To try it without installing: `git clone` this repo and run `claude --plugin-dir ./claude-codex-bridge/codex`.
 
 If you have OpenAI's official `codex` plugin installed, both register `/codex:*`, so disable one.
+
+## Windows
+
+Native Windows 11 is supported in PowerShell and Git Bash, without WSL. Windows locking, process inspection and cleanup, and pipe streaming use the Python standard library and Windows APIs. No pip packages, administrator rights, Developer Mode, or symlink privileges are needed. Run the bridge with an explicit Python interpreter and `-X utf8`; do not rely on shebangs, `.py` associations, or a `python3` alias.
+
+From the repository in PowerShell (replace paths with your installation):
+
+```powershell
+python -X utf8 .\codex\scripts\codex_bridge.py --help
+python -X utf8 .\codex\scripts\codex_bridge.py config show
+$env:CODEX_BRIDGE_HOME = 'C:\Users\you\Bridge Data'
+& 'C:\Program Files\Python310\python.exe' -X utf8 'C:\src\claude-codex-bridge\codex\scripts\codex_bridge.py' jobs
+```
+
+From Git Bash, use native Windows Python explicitly:
+
+```bash
+python -X utf8 './codex/scripts/codex_bridge.py' --help
+CODEX_BRIDGE_HOME='C:/Users/you/Bridge Data' python -X utf8 './codex/scripts/codex_bridge.py' config show
+```
+
+On Windows, printed watch/log/cancel/attach commands use PowerShell syntax and the current interpreter's full path. Paste them into PowerShell; in Git Bash invoke `python -X utf8 '<script path>'` with the same arguments and a Bash environment prefix when needed. PowerShell uses `&` for quoted executable paths and `$env:CODEX_BRIDGE_HOME = '...'` for a custom home. Attach uses `Set-Location -LiteralPath '...'; & ...` so it also works in Windows PowerShell 5.1. Prefer JSON arrays for `extra_args` to preserve spaces and backslashes, for example `extra_args=["--add-dir","C:\\work\\project"]`.
+
+Printed attach commands may use a Python wrapper to preserve arguments containing quotes. Copy the complete command verbatim.
+
+PowerShell 5.1 can remove embedded double quotes when passing arguments to native programs. For structured settings, use its stop-parsing token and escaped quotes (from the repository):
+
+```powershell
+python -X utf8 .\codex\scripts\codex_bridge.py --% config set "extra_args=[\"--add-dir\",\"C:/work/project\"]"
+```
+
+The single-quoted JSON examples elsewhere use Unix/Git Bash quoting. From a Bash tool, run a generated PowerShell command through `powershell.exe -NoProfile -Command '<complete command>'`, escaping the outer Bash quotes as needed.
 
 ## Usage
 
@@ -138,7 +170,7 @@ Codex runs with `danger-full-access` and approval policy `never` by default. It 
 
 ## The script
 
-The plugin is a thin layer over `codex/scripts/codex_bridge.py`, which you can call directly. It refreshes a stable symlink at `~/.claude/codex-bridge/bin/codex_bridge.py`.
+The plugin is a thin layer over `codex/scripts/codex_bridge.py`, which you can call directly on Unix or through Python on Windows. It refreshes a stable launcher at `~/.claude/codex-bridge/bin/codex_bridge.py`: a symlink on Unix and an ordinary Python stub on Windows.
 
 ```text
 run [--name L] [--role R] [--model M] [--effort E] [--sandbox S] [--cd DIR] [--background] [--continue] -
@@ -169,6 +201,12 @@ Nothing shows up under `/`: restart Claude Code and check that `claude plugin li
 
 ```bash
 python3 -m unittest discover -s codex/tests -v
+```
+
+On Windows (PowerShell or Git Bash):
+
+```text
+python -X utf8 -m unittest discover -s codex/tests -v
 ```
 
 The tests are offline and make no model calls.
